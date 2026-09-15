@@ -1,0 +1,11 @@
+TradingAgents Skill
+Copyright 2026 TradingAgents Skill contributors
+
+Independent integration for TauricResearch/TradingAgents:
+https://github.com/TauricResearch/TradingAgents
+Reviewed upstream revision: be952b8eccb49720509af544c6675233bc1f10d0
+
+TradingAgents is distributed by its authors under the Apache License, Version 2.0.
+This repository supplies original skill instructions and adapter scripts; the
+upstream implementation is installed separately. No affiliation or endorsement
+by TauricResearch is implied. The Apache license text is retained in LICENSE.

@@ -1,0 +1,1 @@
+tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@be952b8eccb49720509af544c6675233bc1f10d0

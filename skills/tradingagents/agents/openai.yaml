@@ -1,0 +1,4 @@
+interface:
+  display_name: "TradingAgents"
+  short_description: "Run multi-agent market research with TradingAgents"
+  default_prompt: "Use $tradingagents to analyze NVDA with my configured provider and save a Chinese research report."
