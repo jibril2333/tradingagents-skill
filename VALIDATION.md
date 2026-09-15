@@ -18,8 +18,12 @@ test's example model IDs were not in its known-model list, then constructed the
 graph successfully; model availability was not tested.
 
 Live provider authentication, live market data, paid inference and an end-to-end
-research run have not been tested. The GitHub Actions workflow has been authored
-for Windows/Linux and Python 3.10/3.12; those remote jobs have not been run here.
+research run have not been tested. The GitHub Actions workflow covers
+Windows/Linux and Python 3.10/3.12. Current remote results are available in
+[GitHub Actions](https://github.com/jibril2333/tradingagents-skill/actions/workflows/validate.yml).
+The initial Windows CI run exposed an assertion comparing a resolved output path
+with an unresolved temporary-directory alias. The assertion now resolves both
+paths before checking containment.
 
 Selected installed dependencies in the validated environment:
 

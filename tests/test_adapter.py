@@ -94,7 +94,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(FakeGraph.last_config["data_vendors"]["macro_data"], "fred")
         self.assertFalse(FakeGraph.last_config["checkpoint_enabled"])
         for key in ("results_dir", "data_cache_dir", "memory_log_path"):
-            self.assertTrue(Path(FakeGraph.last_config[key]).is_relative_to(self.out))
+            # Windows runners may expose TEMP through an 8.3 path alias.
+            self.assertTrue(Path(FakeGraph.last_config[key]).is_relative_to(self.out.resolve()))
         self.assertEqual(result["signal"], "Overweight")
         self.assertEqual(result["status"], "completed")
         self.assertIn("研究决策", Path(result["final_decision"]).read_text(encoding="utf-8"))
