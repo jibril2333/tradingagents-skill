@@ -16,15 +16,15 @@ description: Run the TauricResearch TradingAgents multi-agent research workflow 
 
 ## 明确输入
 
-- ticker 使用数据源代码（`NVDA`、`7203.T`、`BTC-USD`）。只给公司名或交易所含糊时先查证。
-- 日期 `YYYY-MM-DD`，默认今天，不接受未来日期。历史日期不等于无前视偏差的回测。
-- 加密货币传 `--asset-type crypto`。
+- ticker 使用数据源代码（`NVDA`、`7203.T`、`BTC-USD`）。只给公司名或交易所含糊时先查证。代码按上游规则归一化（`BTCUSD` → `BTC-USD`，`XAUUSD` → `GC=F`）。
+- 日期 `YYYY-MM-DD`，默认今天，不接受未来日期。历史日期不等于无前视偏差的回测；分析历史日期时，上游会拒绝提供市值、市盈率等只有当前口径的字段，报告据实说明即可。
+- 资产类型按 ticker 自动判定，与上游 CLI 一致；加密货币自动去掉基本面分析师。需要覆盖时用 `--asset-type`。
 - 报告语言跟随用户：中文对话传 `--language Chinese`。
-- 以下保持默认，除非用户提出：`--analysts market social news fundamentals`、`--debate-rounds 1`、`--risk-rounds 1`、`--quick-model sonnet`、`--deep-model opus`（Research Manager 与 Portfolio Manager 使用 deep）、记忆日志开启（`--no-memory` 关闭）。
+- 其余保持默认，除非用户提出：分析师全选、辩论与风险讨论各 1 轮（上游默认值；`--research-depth` 同时设置两者，上游 CLI 的档位是 1、3、5）、`--quick-model sonnet`、`--deep-model opus`（Research Manager 与 Portfolio Manager 使用 deep）、记忆日志开启（`--no-memory` 关闭）。
 
 ## 运行循环
 
-1. `TA init --ticker NVDA --date YYYY-MM-DD --language Chinese`，得到 JSON，记下 `run_dir`。
+1. `TA init --ticker NVDA --date YYYY-MM-DD --language Chinese`，得到 JSON，记下 `run_dir`（默认与上游 CLI 相同：结果目录下的 `TICKER/日期`）。
 2. 当 `status` 为 `tasks` 或 `waiting`，为 `tasks` 中每一项派发一个子代理：
    - Agent 工具，`subagent_type: general-purpose`，`model` 用该项的 `model`，`description` 用该项的 `agent`，`prompt` 原样使用 `subagent_prompt`。
    - `parallel` 为 `true` 时，在同一条消息中派发全部任务。

@@ -22,8 +22,10 @@
 | `graph.trading_graph.TradingAgentsGraph` | 以 `__new__` 创建不含 LLM 客户端的实例，调用 `_create_tool_nodes`、`_resolve_benchmark`、`_fetch_returns`、`_memory_as_of`、`resolve_instrument_context`、`_log_state` |
 | `reporting.write_report_tree` | 报告目录 |
 | `dataflows.config.set_config` | 语言、数据源、目录配置 |
+| `dataflows.utils.safe_ticker_component` | 目录名中的代码校验 |
+| `cli.utils.normalize_ticker_symbol` / `detect_asset_type` / `filter_analysts_for_asset_type`、`cli.models` | 运行前的代码归一化、资产类型判定与分析师过滤，与上游 CLI 相同 |
 
-未使用：`llm_clients`（被 `SkillLLM` 取代）、LangGraph 图编译与 checkpoint（被 `ta.py` 步进循环取代）、`cli`。
+未使用：`llm_clients`（被 `SkillLLM` 取代）、LangGraph 图编译与 checkpoint（被 `ta.py` 步进循环取代）、`cli` 的交互式问答与终端展示。
 
 ## 升级
 

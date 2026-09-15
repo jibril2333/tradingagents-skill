@@ -1,8 +1,10 @@
 """Offline tests: the pinned upstream runs for real, network and models are stubbed."""
 
+import atexit
 import contextlib
 import io
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -13,6 +15,14 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills" / "tradingagents" / "scripts"))
+
+# Upstream reads results_dir from the environment when its config module is
+# first imported, so redirect it before importing anything upstream: the state
+# log and the default run directory must not land in the real home directory.
+_RESULTS = tempfile.TemporaryDirectory()
+atexit.register(_RESULTS.cleanup)
+RESULTS_DIR = Path(_RESULTS.name).resolve()
+os.environ["TRADINGAGENTS_RESULTS_DIR"] = str(RESULTS_DIR)
 
 try:
     import tradingagents  # noqa: F401
@@ -165,7 +175,8 @@ class DriverTest(unittest.TestCase):
         self.assertIn("## V. Portfolio Manager Decision", complete)
         self.assertIn("**Overall Sentiment:** **Mixed**", complete)
         self.assertIn("FINAL TRANSACTION PROPOSAL: **BUY**", complete)
-        self.assertTrue(list((run_dir / "logs").rglob("full_states_log_2026-09-15.json")))
+        self.assertTrue((RESULTS_DIR / "NVDA" / "TradingAgentsStrategy_logs"
+                         / "full_states_log_2026-09-15.json").is_file())
         self.assertIn("[2026-09-15 | NVDA | Overweight | pending]", self.memory.read_text(encoding="utf-8"))
 
         code, again = run_cli("step", "--run-dir", run_dir)
@@ -241,6 +252,49 @@ class DriverTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), "NVDA 2026-09-01 2026-09-15")
         self.assertIn('"tool": "get_stock_data"', (run_dir / "logs" / "tool_calls.jsonl").read_text())
+
+    def test_crypto_ticker_follows_upstream_cli_defaults(self):
+        code, out = run_cli("init", "--ticker", "btcusd", "--date", "2026-09-15", "--no-memory")
+        self.assertEqual(code, 0, out)
+        run_dir = Path(out["run_dir"])
+        # Upstream normalises the symbol, detects crypto from the canonical
+        # form, drops the fundamentals analyst, and writes to RESULTS/TICKER/DATE.
+        self.assertEqual(run_dir, RESULTS_DIR / "BTC-USD" / "2026-09-15")
+        self.assertEqual([t["agent"] for t in out["tasks"]],
+                         ["Market Analyst", "Sentiment Analyst", "News Analyst"])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))["run"]
+        self.assertEqual((state["ticker"], state["asset_type"]), ("BTC-USD", "crypto"))
+        self.assertEqual(state["dropped_analysts"], ["fundamentals"])
+        self.assertTrue(state["asset_type_detected"])
+
+        code, again = run_cli("init", "--ticker", "BTC-USD", "--date", "2026-09-15", "--no-memory")
+        self.assertEqual((code, again["status"]), (2, "error"))
+
+    def test_research_depth_sets_both_round_counts(self):
+        run_dir, out = self.init("--analysts", "market", "--research-depth", "3", "--no-memory")
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual((state["run"]["debate_rounds"], state["run"]["risk_rounds"]), (3, 3))
+        self.assertEqual(state["config_overrides"]["max_debate_rounds"], 3)
+        # An explicit flag still wins over the depth setting.
+        code, out = run_cli("init", "--ticker", "NVDA", "--date", "2026-09-15", "--no-memory",
+                            "--research-depth", "3", "--risk-rounds", "1",
+                            "--run-dir", self.root / "depth")
+        state = json.loads((self.root / "depth" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual((state["run"]["debate_rounds"], state["run"]["risk_rounds"]), (3, 1))
+
+    def test_defaults_match_upstream_config(self):
+        run_dir, _ = self.init("--analysts", "market", "--no-memory")
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        self.assertEqual(state["run"]["debate_rounds"], DEFAULT_CONFIG["max_debate_rounds"])
+        self.assertEqual(state["run"]["risk_rounds"], DEFAULT_CONFIG["max_risk_discuss_rounds"])
+        self.assertEqual(state["run"]["language"], DEFAULT_CONFIG["output_language"])
+        self.assertEqual(state["run"]["asset_type"], "stock")
+        # Only knobs this skill must control are overridden.
+        self.assertEqual(set(state["config_overrides"]) - {"memory_log_path"},
+                         {"output_language", "max_debate_rounds", "max_risk_discuss_rounds",
+                          "checkpoint_enabled", "llm_provider", "deep_think_llm", "quick_think_llm"})
 
     def test_rejects_bad_inputs(self):
         code, out = run_cli("init", "--ticker", "../etc", "--run-dir", self.root / "x")

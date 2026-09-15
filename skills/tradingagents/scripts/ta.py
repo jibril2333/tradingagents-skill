@@ -35,7 +35,6 @@ STATE_FILE = "state.json"
 ANALYSTS = ("market", "social", "news", "fundamentals")
 RATINGS = ("Buy", "Overweight", "Hold", "Underweight", "Sell")
 DEFAULT_MODELS = {"quick": "sonnet", "deep": "opus"}
-DEFAULT_RUNS_DIR = Path.home() / ".tradingagents" / "runs"
 
 # Same model tier per node as upstream GraphSetup.setup_graph.
 NODE_TIERS = {
@@ -62,8 +61,13 @@ RISK_NODES = ("Aggressive Analyst", "Conservative Analyst", "Neutral Analyst")
 
 
 def load_upstream():
+    # cli.utils holds the symbol/asset-type behaviour the upstream CLI applies
+    # before a run; reusing it keeps this skill's defaults identical.
+    from cli.models import AnalystType, AssetType
+    from cli.utils import detect_asset_type, filter_analysts_for_asset_type, normalize_ticker_symbol
     from tradingagents import agents
     from tradingagents.agents import schemas
+    from tradingagents.dataflows.utils import safe_ticker_component
     from tradingagents.agents.utils.agent_utils import create_msg_delete
     from tradingagents.agents.utils.memory import TradingMemoryLog
     from tradingagents.dataflows.config import set_config
@@ -91,6 +95,9 @@ def load_upstream():
         "Portfolio Manager": agents.create_portfolio_manager,
     }
     return SimpleNamespace(
+        AnalystType=AnalystType, AssetType=AssetType, detect_asset_type=detect_asset_type,
+        filter_analysts_for_asset_type=filter_analysts_for_asset_type,
+        normalize_ticker_symbol=normalize_ticker_symbol, safe_ticker_component=safe_ticker_component,
         factories=factories, schemas=schemas, create_msg_delete=create_msg_delete,
         TradingMemoryLog=TradingMemoryLog, set_config=set_config, DEFAULT_CONFIG=DEFAULT_CONFIG,
         build_analyst_execution_plan=build_analyst_execution_plan,
@@ -565,6 +572,11 @@ def installed_source() -> dict:
             "verified_revision": commit == UPSTREAM_COMMIT and source_url == UPSTREAM_URL.lower()}
 
 
+def _depth_round(research_depth: int | None, env_var: str) -> int | None:
+    """Research depth applies unless the matching upstream env override is set."""
+    return None if os.environ.get(env_var) else research_depth
+
+
 def positive(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -581,11 +593,15 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="Create a run and return its first tasks")
     init.add_argument("--ticker", required=True)
     init.add_argument("--date", default=date.today().isoformat(), help="YYYY-MM-DD, default today")
-    init.add_argument("--asset-type", choices=("stock", "crypto"), default="stock")
-    init.add_argument("--analysts", nargs="+", choices=ANALYSTS, default=list(ANALYSTS))
+    init.add_argument("--asset-type", choices=("stock", "crypto"),
+                      help="Default: detected from the ticker, as the upstream CLI does")
+    init.add_argument("--analysts", nargs="+", choices=ANALYSTS, default=list(ANALYSTS),
+                      help="Upstream drops the fundamentals analyst for crypto")
     init.add_argument("--language", default=os.getenv("TRADINGAGENTS_OUTPUT_LANGUAGE") or "English")
-    init.add_argument("--debate-rounds", type=positive, default=1)
-    init.add_argument("--risk-rounds", type=positive, default=1)
+    init.add_argument("--research-depth", type=positive,
+                      help="Upstream depth: sets both round counts (CLI offers 1, 3, 5)")
+    init.add_argument("--debate-rounds", type=positive)
+    init.add_argument("--risk-rounds", type=positive)
     init.add_argument("--data-vendor", choices=("yfinance", "alpha_vantage"), default="yfinance")
     init.add_argument("--quick-model", default=DEFAULT_MODELS["quick"],
                       help="Subagent model for upstream quick-think nodes")
@@ -594,7 +610,8 @@ def build_parser() -> argparse.ArgumentParser:
     memory = init.add_mutually_exclusive_group()
     memory.add_argument("--memory-log", type=Path, help="Decision log path (default: upstream)")
     memory.add_argument("--no-memory", action="store_true", help="Do not read or write the decision log")
-    init.add_argument("--run-dir", type=Path)
+    init.add_argument("--run-dir", type=Path,
+                      help="Default: RESULTS_DIR/TICKER/DATE, the upstream CLI layout")
 
     for name, text in (("step", "Ingest saved answers and return the next tasks"),
                        ("status", "Show run progress without advancing")):
@@ -612,7 +629,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_init(args) -> dict:
-    ticker = args.ticker.strip().upper()
+    u = load_upstream()
+    # Upstream CLI order: normalise the symbol, classify the asset from the
+    # canonical form, then drop analysts that do not apply to it.
+    ticker = u.normalize_ticker_symbol(args.ticker)
     if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=\-]{0,39}", ticker) or ".." in ticker:
         raise UsageError("Use a data-provider ticker such as NVDA, 7203.T or BTC-USD, not a name or path.")
     try:
@@ -621,19 +641,36 @@ def cmd_init(args) -> dict:
         raise UsageError("Date must be YYYY-MM-DD.") from exc
     if trade_date > date.today():
         raise UsageError("Future analysis dates are not supported.")
-    run_dir = (args.run_dir or DEFAULT_RUNS_DIR / f"{slug(ticker)}_{trade_date}_{datetime.now():%H%M%S}")
-    run_dir = run_dir.expanduser().resolve()
-    if run_dir.exists():
-        raise UsageError(f"Run directory already exists: {run_dir}")
 
-    u = load_upstream()
-    analysts = list(dict.fromkeys(args.analysts))
+    asset_type = args.asset_type or u.detect_asset_type(ticker).value
+    requested = list(dict.fromkeys(args.analysts))
+    analysts = [analyst.value for analyst in u.filter_analysts_for_asset_type(
+        [u.AnalystType(key) for key in requested], u.AssetType(asset_type))]
+    dropped = [key for key in requested if key not in analysts]
+    if not analysts:
+        raise UsageError(f"No analyst applies to a {asset_type} run; upstream drops {', '.join(dropped)}.")
     plan = u.build_analyst_execution_plan(analysts)
+
+    # Upstream research depth sets both round counts, and an environment
+    # override wins over it; explicit flags win over both.
+    debate_rounds = args.debate_rounds or _depth_round(args.research_depth, "TRADINGAGENTS_MAX_DEBATE_ROUNDS") \
+        or u.DEFAULT_CONFIG["max_debate_rounds"]
+    risk_rounds = args.risk_rounds or _depth_round(args.research_depth, "TRADINGAGENTS_MAX_RISK_ROUNDS") \
+        or u.DEFAULT_CONFIG["max_risk_discuss_rounds"]
+
+    # Same layout the upstream CLI writes: results_dir/TICKER/DATE, with the
+    # report tree inside it and the state log under results_dir/TICKER.
+    default_dir = (Path(u.DEFAULT_CONFIG["results_dir"]) / u.safe_ticker_component(ticker)
+                   / trade_date.isoformat())
+    run_dir = (args.run_dir or default_dir).expanduser().resolve()
+    if run_dir.exists():
+        raise UsageError(f"Run directory already exists: {run_dir}. Continue it with "
+                         f"`step --run-dir`, or start a separate run with `--run-dir`.")
+
     overrides = {
         "output_language": args.language,
-        "max_debate_rounds": args.debate_rounds,
-        "max_risk_discuss_rounds": args.risk_rounds,
-        "results_dir": str(run_dir / "logs"),
+        "max_debate_rounds": debate_rounds,
+        "max_risk_discuss_rounds": risk_rounds,
         "checkpoint_enabled": False,
         "llm_provider": "skill-subagent",
         "deep_think_llm": args.deep_model,
@@ -651,8 +688,10 @@ def cmd_init(args) -> dict:
     st = {
         "version": 1,
         "run": {
-            "ticker": ticker, "trade_date": trade_date.isoformat(), "asset_type": args.asset_type,
-            "analysts": analysts, "language": args.language,
+            "ticker": ticker, "trade_date": trade_date.isoformat(), "asset_type": asset_type,
+            "asset_type_detected": args.asset_type is None,
+            "analysts": analysts, "dropped_analysts": dropped, "language": args.language,
+            "debate_rounds": debate_rounds, "risk_rounds": risk_rounds,
             "analyst_nodes": {spec.agent_node: spec.key for spec in plan.specs},
             "models": {"quick": args.quick_model, "deep": args.deep_model},
             "created_at": datetime.now(timezone.utc).isoformat(),

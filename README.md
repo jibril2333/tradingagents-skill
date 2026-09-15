@@ -51,9 +51,9 @@ skills/tradingagents/scripts/ta doctor
 
 > 用 TradingAgents 分析 NVDA，日期今天，输出中文报告。
 
-skill 会依次执行 `ta init`、派发子代理、`ta step`，完成后读取 `result.json` 与最终决策并总结。结果保存在 `~/.tradingagents/runs/TICKER_DATE_HHMMSS/`。
+skill 会依次执行 `ta init`、派发子代理、`ta step`，完成后读取 `result.json` 与最终决策并总结。结果保存在上游 CLI 的同一位置：`~/.tradingagents/logs/TICKER/日期/`（可用 `TRADINGAGENTS_RESULTS_DIR` 覆盖）。
 
-常用参数：`--analysts`、`--debate-rounds`、`--risk-rounds`、`--quick-model`、`--deep-model`、`--asset-type crypto`、`--no-memory`。完整说明见 [SKILL.md](skills/tradingagents/SKILL.md) 与 [setup.md](skills/tradingagents/references/setup.md)。
+不带参数时的行为与上游默认一致：代码归一化、按 ticker 判定资产类型（加密货币自动去掉基本面分析师）、分析师全选、辩论与风险讨论各 1 轮、英文输出、yfinance 数据源、跨运行记忆日志。常用参数：`--research-depth`（对应上游 CLI 的 1/3/5 档，同时设置两个轮数）、`--analysts`、`--quick-model`、`--deep-model`、`--language`、`--no-memory`。完整说明见 [SKILL.md](skills/tradingagents/SKILL.md) 与 [setup.md](skills/tradingagents/references/setup.md)。
 
 ## 额度
 

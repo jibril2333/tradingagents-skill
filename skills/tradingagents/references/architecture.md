@@ -26,6 +26,25 @@ LangGraph 编排被 `ta.py` 的步进循环替代，以便在每次模型调用�
 
 模型档位与上游 `GraphSetup` 相同：Research Manager、Portfolio Manager 为 deep，其余为 quick。
 
+## 默认值
+
+不带参数时与上游保持一致，来源如下：
+
+| 项目 | 默认值 | 来源 |
+| --- | --- | --- |
+| 分析师 | 全选四位 | 上游 `selected_analysts` 默认值；加密货币按 `filter_analysts_for_asset_type` 去掉基本面 |
+| 辩论 / 风险讨论轮数 | 各 1 轮 | `DEFAULT_CONFIG`；`--research-depth` 对应 CLI 的深度档位，同时设置两者，`TRADINGAGENTS_MAX_*_ROUNDS` 优先 |
+| 代码归一化与资产类型 | `normalize_ticker_symbol` + `detect_asset_type` | 上游 `cli.utils`，与 CLI 完全相同 |
+| 输出语言 | English | `DEFAULT_CONFIG` |
+| 数据源 | yfinance（宏观 FRED、预测市场 Polymarket） | `DEFAULT_CONFIG.data_vendors` |
+| 记忆日志 | `~/.tradingagents/memory/trading_memory.md` | `DEFAULT_CONFIG` |
+| 缓存 | `~/.tradingagents/cache` | `DEFAULT_CONFIG` |
+| run 目录 | `结果目录/TICKER/日期`，报告在其下 | 上游 CLI 的 `results_dir/TICKER/DATE/reports` |
+| 状态日志 | `结果目录/TICKER/TradingAgentsStrategy_logs/` | 上游 `_log_state` |
+| checkpoint | 关闭 | `DEFAULT_CONFIG` |
+
+本 skill 只覆盖这些配置项：`output_language`、两个轮数、`checkpoint_enabled`、`llm_provider`、`deep_think_llm`、`quick_think_llm`，以及显式指定时的 `memory_log_path` 与 `data_vendors`。provider 相关参数（temperature、max_tokens、reasoning effort、重试次数）不适用，保持上游默认。
+
 ## 与上游的差异
 
 - 模型由子代理承担，不经过 provider SDK；`temperature`、`max_tokens`、reasoning effort 等 provider 参数不适用。
@@ -61,11 +80,10 @@ RUN_DIR/
   tasks/NN-agent.response.md     子代理答案（被拒的改名为 .rejected-N.md）
   cache/sentiment/               情绪分析师预取数据
   logs/tool_calls.jsonl          分析师工具调用记录
-  logs/NVDA/TradingAgentsStrategy_logs/full_states_log_DATE.json   上游状态日志
   reports/complete_report.md     上游整合报告
   reports/1_analysts ... 5_portfolio   上游分节报告
   reports/final_decision.md      Portfolio Manager 决策原文
   result.json                    评级、状态、路径、上游版本
 ```
 
-默认 run 目录为 `~/.tradingagents/runs/TICKER_DATE_HHMMSS`。记忆日志默认沿用上游 `~/.tradingagents/memory/trading_memory.md`（或 `TRADINGAGENTS_MEMORY_LOG_PATH`），跨运行积累复盘经验；`--memory-log PATH` 指定其他文件，`--no-memory` 关闭。
+默认 run 目录为 `结果目录/TICKER/日期`（结果目录取 `DEFAULT_CONFIG.results_dir`，默认 `~/.tradingagents/logs`，可用 `TRADINGAGENTS_RESULTS_DIR` 覆盖），与上游 CLI 的报告位置相同；同一 ticker 和日期重跑时用 `--run-dir` 另开目录，或直接 `step` 继续原有 run。记忆日志默认沿用上游 `~/.tradingagents/memory/trading_memory.md`（或 `TRADINGAGENTS_MEMORY_LOG_PATH`），跨运行积累复盘经验；`--memory-log PATH` 指定其他文件，`--no-memory` 关闭。
