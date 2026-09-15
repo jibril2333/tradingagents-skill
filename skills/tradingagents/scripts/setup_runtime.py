@@ -10,7 +10,8 @@ import venv
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env-dir", type=Path, required=True)
+    parser.add_argument("--env-dir", type=Path, default=Path.home() / ".tradingagents-skill" / "venv",
+                        help="Virtual environment path (default: ~/.tradingagents-skill/venv)")
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         parser.error("Python 3.10 or newer is required (3.12 recommended).")

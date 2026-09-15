@@ -1,40 +1,32 @@
-# 上游接口与维护
+# 上游依赖与升级
 
-核对日期：2026-09-15。
+核对日期：2026-09-16。
 
 - 项目：[TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents)
-- 固定提交：`be952b8eccb49720509af544c6675233bc1f10d0`
-- 该提交的 `pyproject.toml`：版本 `0.4.0`，Python `>=3.10`。
-- 许可证：Apache-2.0。适配器通过安装依赖调用上游，不复制其多智能体实现。
+- 固定提交：`be952b8eccb49720509af544c6675233bc1f10d0`（包版本 `0.4.0`，Python `>=3.10`）
+- 许可证：Apache-2.0。上游源码在安装时获取，本仓库不重复分发。
 
-## 实际使用的 API
+## 直接使用的上游接口
 
-```python
-from copy import deepcopy
-from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.graph.trading_graph import TradingAgentsGraph
+| 模块 | 用途 |
+| --- | --- |
+| `tradingagents.agents.create_*` | 全部 12 个智能体节点，原样调用 |
+| `agents.schemas` | 结构化输出 schema 与 `render_*` |
+| `agents.utils.agent_utils.create_msg_delete` | 非首位分析师的占位消息 |
+| `agents.utils.memory.TradingMemoryLog` | 记忆日志读写 |
+| `graph.analyst_execution.build_analyst_execution_plan` | 分析师选择与节点名 |
+| `graph.conditional_logic.ConditionalLogic` | 辩论与风险讨论路由 |
+| `graph.propagation.Propagator.create_initial_state` | 初始状态 |
+| `graph.reflection.Reflector` | 复盘提示与调用 |
+| `graph.signal_processing.SignalProcessor` | 五档评级或 `REVIEW` |
+| `graph.trading_graph.TradingAgentsGraph` | 以 `__new__` 创建不含 LLM 客户端的实例，调用 `_create_tool_nodes`、`_resolve_benchmark`、`_fetch_returns`、`_memory_as_of`、`resolve_instrument_context`、`_log_state` |
+| `reporting.write_report_tree` | 报告目录 |
+| `dataflows.config.set_config` | 语言、数据源、目录配置 |
 
-config = deepcopy(DEFAULT_CONFIG)
-# 在构造之前设置 provider、两个模型、输出路径及其他必要配置。
-graph = TradingAgentsGraph(selected_analysts=["market", "news"], debug=False, config=config)
-state, signal = graph.propagate("NVDA", "2026-09-14", asset_type="stock")
-report_path = graph.save_reports(state, "NVDA", save_path="reports")
-```
-
-本封装在调用前深复制配置，合并 `data_vendors`，并覆盖三个默认用户目录路径。每次使用新的输出目录，防止上游记忆反思机制跨研究意外复用。
-
-评级是五档字符串或 `REVIEW`；不是旧示例中的三档大写 BUY/HOLD/SELL。`save_reports` 不保证包含 `final_trade_decision` 字段，因此封装单独导出原始决策。
-
-## 证据位置
-
-- [Graph、propagate、save_reports](https://github.com/TauricResearch/TradingAgents/blob/be952b8eccb49720509af544c6675233bc1f10d0/tradingagents/graph/trading_graph.py)
-- [默认配置与环境覆盖](https://github.com/TauricResearch/TradingAgents/blob/be952b8eccb49720509af544c6675233bc1f10d0/tradingagents/default_config.py)
-- [API key 对照表](https://github.com/TauricResearch/TradingAgents/blob/be952b8eccb49720509af544c6675233bc1f10d0/tradingagents/llm_clients/api_key_env.py)
-- [评级解析](https://github.com/TauricResearch/TradingAgents/blob/be952b8eccb49720509af544c6675233bc1f10d0/tradingagents/agents/utils/rating.py)
-- [报告导出](https://github.com/TauricResearch/TradingAgents/blob/be952b8eccb49720509af544c6675233bc1f10d0/tradingagents/reporting.py)
+未使用：`llm_clients`（被 `SkillLLM` 取代）、LangGraph 图编译与 checkpoint（被 `ta.py` 步进循环取代）、`cli`。
 
 ## 升级
 
-用户要求升级时，先核对目标提交的上述接口及依赖，再同时更新 requirements.txt 和 run_analysis.py 中的提交常量及文档。重新运行离线测试、skill 验证器和真实上游接口 smoke test。模型/数据服务的端到端验证需单独记录，不能用 mock 结果代替。
-
-仅固定顶层 Git 提交；间接依赖遵循上游范围。需要严格依赖复现的团队可在自己的平台生成并维护完整锁文件。
+1. 在新提交上核对上表接口，尤其是 `GraphSetup.setup_graph` 的节点、模型档位与边，以及各智能体调用 `llm` 的方式（`invoke`、`with_structured_output`、`bind_tools`）。
+2. 同步 `ta.py` 中的 `NODE_TIERS`、`next_node` 和 `UPSTREAM_COMMIT`，以及 `requirements.txt`。
+3. 运行 `python -m unittest discover -s tests -v` 与 `ta.py doctor`，再做一次真实子代理运行并更新 VALIDATION.md。

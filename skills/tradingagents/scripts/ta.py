@@ -1,0 +1,764 @@
+"""TradingAgents driver for agent skills.
+
+Upstream agents, prompts, data tools, routing logic, rating parser, report
+writer and memory log run unchanged in this process. Every point where upstream
+calls an LLM becomes a task file answered by a host subagent (for example a
+Claude Code subagent on a subscription), so no provider API key is used.
+
+Commands print one JSON object to stdout; see references/protocol.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import importlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from copy import deepcopy
+from datetime import date, datetime, timezone
+from importlib import metadata
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+UPSTREAM_COMMIT = "be952b8eccb49720509af544c6675233bc1f10d0"
+UPSTREAM_URL = "https://github.com/TauricResearch/TradingAgents"
+SCRIPT = Path(__file__).resolve()
+STATE_FILE = "state.json"
+ANALYSTS = ("market", "social", "news", "fundamentals")
+RATINGS = ("Buy", "Overweight", "Hold", "Underweight", "Sell")
+DEFAULT_MODELS = {"quick": "sonnet", "deep": "opus"}
+DEFAULT_RUNS_DIR = Path.home() / ".tradingagents" / "runs"
+
+# Same model tier per node as upstream GraphSetup.setup_graph.
+NODE_TIERS = {
+    "Market Analyst": "quick",
+    "Sentiment Analyst": "quick",
+    "News Analyst": "quick",
+    "Fundamentals Analyst": "quick",
+    "Bull Researcher": "quick",
+    "Bear Researcher": "quick",
+    "Research Manager": "deep",
+    "Trader": "quick",
+    "Aggressive Analyst": "quick",
+    "Conservative Analyst": "quick",
+    "Neutral Analyst": "quick",
+    "Portfolio Manager": "deep",
+}
+DEBATE_NODES = ("Bull Researcher", "Bear Researcher")
+RISK_NODES = ("Aggressive Analyst", "Conservative Analyst", "Neutral Analyst")
+
+
+# --------------------------------------------------------------------------
+# Upstream access
+# --------------------------------------------------------------------------
+
+
+def load_upstream():
+    from tradingagents import agents
+    from tradingagents.agents import schemas
+    from tradingagents.agents.utils.agent_utils import create_msg_delete
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+    from tradingagents.dataflows.config import set_config
+    from tradingagents.default_config import DEFAULT_CONFIG
+    from tradingagents.graph.analyst_execution import build_analyst_execution_plan
+    from tradingagents.graph.conditional_logic import ConditionalLogic
+    from tradingagents.graph.propagation import Propagator
+    from tradingagents.graph.reflection import Reflector
+    from tradingagents.graph.signal_processing import SignalProcessor
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+    from tradingagents.reporting import write_report_tree
+
+    factories = {
+        "Market Analyst": agents.create_market_analyst,
+        "Sentiment Analyst": agents.create_sentiment_analyst,
+        "News Analyst": agents.create_news_analyst,
+        "Fundamentals Analyst": agents.create_fundamentals_analyst,
+        "Bull Researcher": agents.create_bull_researcher,
+        "Bear Researcher": agents.create_bear_researcher,
+        "Research Manager": agents.create_research_manager,
+        "Trader": agents.create_trader,
+        "Aggressive Analyst": agents.create_aggressive_debator,
+        "Conservative Analyst": agents.create_conservative_debator,
+        "Neutral Analyst": agents.create_neutral_debator,
+        "Portfolio Manager": agents.create_portfolio_manager,
+    }
+    return SimpleNamespace(
+        factories=factories, schemas=schemas, create_msg_delete=create_msg_delete,
+        TradingMemoryLog=TradingMemoryLog, set_config=set_config, DEFAULT_CONFIG=DEFAULT_CONFIG,
+        build_analyst_execution_plan=build_analyst_execution_plan,
+        ConditionalLogic=ConditionalLogic, Propagator=Propagator, Reflector=Reflector,
+        SignalProcessor=SignalProcessor, TradingAgentsGraph=TradingAgentsGraph,
+        write_report_tree=write_report_tree,
+    )
+
+
+def build_config(u, overrides: dict) -> dict:
+    config = deepcopy(u.DEFAULT_CONFIG)
+    overrides = deepcopy(overrides)
+    config.setdefault("data_vendors", {}).update(overrides.pop("data_vendors", {}))
+    config.update(overrides)
+    return config
+
+
+def graph_shell(u, config: dict):
+    """A TradingAgentsGraph without LLM clients.
+
+    ``__init__`` builds provider clients, which is exactly what this skill
+    replaces; the helper methods used here only need ``config`` and the memory
+    log, so they run as upstream wrote them.
+    """
+    u.set_config(config)
+    os.makedirs(config["data_cache_dir"], exist_ok=True)
+    os.makedirs(config["results_dir"], exist_ok=True)
+    graph = u.TradingAgentsGraph.__new__(u.TradingAgentsGraph)
+    graph.config = config
+    graph.debug = False
+    graph.memory_log = u.TradingMemoryLog(config)
+    graph.conditional_logic = u.ConditionalLogic(
+        max_debate_rounds=config["max_debate_rounds"],
+        max_risk_discuss_rounds=config["max_risk_discuss_rounds"],
+    )
+    graph.log_states_dict = {}
+    graph.ticker = None
+    return graph
+
+
+def all_tools(u) -> dict:
+    tools = {}
+    for tool_node in u.TradingAgentsGraph._create_tool_nodes(None).values():
+        tools.update(tool_node.tools_by_name)
+    return tools
+
+
+def cache_calls(function, cache_dir: Path, label: str):
+    """Disk-memoise a data fetch so re-running a node reuses the same data."""
+    if getattr(function, "_ta_cached", False):
+        return function
+
+    def wrapper(*args, **kwargs):
+        key = json.dumps([label, args, kwargs], sort_keys=True, default=str)
+        path = cache_dir / f"{label}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.txt"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        value = function(*args, **kwargs)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(value), encoding="utf-8")
+        return value
+
+    wrapper._ta_cached = True
+    return wrapper
+
+
+def install_fetch_cache(run_dir: Path):
+    # The sentiment analyst fetches its data inside the node; the node runs once
+    # to produce the prompt and again to apply the answer.
+    module = importlib.import_module("tradingagents.agents.analysts.sentiment_analyst")
+    cache_dir = run_dir / "cache" / "sentiment"
+    module.fetch_stocktwits_messages = cache_calls(module.fetch_stocktwits_messages, cache_dir, "stocktwits")
+    module.fetch_reddit_posts = cache_calls(module.fetch_reddit_posts, cache_dir, "reddit")
+    if not getattr(module.get_news, "_ta_cached", False):
+        module.get_news = SimpleNamespace(func=cache_calls(module.get_news.func, cache_dir, "news"),
+                                          _ta_cached=True)
+
+
+# --------------------------------------------------------------------------
+# Run state
+# --------------------------------------------------------------------------
+
+
+def write_json(path: Path, value):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_state(run_dir: Path) -> dict:
+    path = run_dir / STATE_FILE
+    if not path.is_file():
+        raise UsageError(f"No TradingAgents run at {run_dir}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_state(run_dir: Path, st: dict):
+    write_json(run_dir / STATE_FILE, st)
+
+
+class UsageError(Exception):
+    pass
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def command_prefix(*parts: str) -> str:
+    args = [sys.executable, str(SCRIPT), *parts]
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+# --------------------------------------------------------------------------
+# Task files
+# --------------------------------------------------------------------------
+
+
+def render_tools(tools, run_dir: Path) -> str:
+    prefix = command_prefix("tool", "--run-dir", str(run_dir))
+    lines = [
+        "## Data tools",
+        "",
+        "These replace the provider tool-calling interface. Run a tool with Bash; the command prints its result:",
+        "",
+        "```",
+        f"{prefix} <tool_name> name=value [name=value ...]",
+        "```",
+        "",
+        "Quote values that contain spaces. Omit optional arguments to use their defaults.",
+        "Call tools as many times as the task needs, then write the final report.",
+    ]
+    for tool in tools:
+        try:
+            required = set(tool.tool_call_schema.model_json_schema().get("required", []))
+        except Exception:  # noqa: BLE001 - schema introspection is best effort
+            required = set()
+        lines += ["", f"### {tool.name}", "", (tool.description or "").strip(), "", "Arguments:"]
+        for name, spec in tool.args.items():
+            kind = spec.get("type") or "/".join(
+                option.get("type", "") for option in spec.get("anyOf", []) if option.get("type") != "null"
+            )
+            flag = "required" if name in required else f"optional, default {spec.get('default')!r}"
+            lines.append(f"- `{name}` ({kind}, {flag}): {spec.get('description', '')}")
+    return "\n".join(lines)
+
+
+def render_task(run_dir: Path, node: str, request, output_file: Path) -> str:
+    lines = [
+        f"# TradingAgents task: {node}",
+        "",
+        f"You are the **{node}** in a TradingAgents run. The messages under \"Messages\" are exactly "
+        "what the TradingAgents framework sends to its language model at this step. "
+        "Respond as that model: follow the system message and answer the final user message.",
+        "",
+        "## Rules",
+        "",
+        f"- Save only your final answer, in UTF-8, to `{output_file}`. Do not add remarks about these rules.",
+    ]
+    if request.tools:
+        lines.append("- Get data only through the tools under \"Data tools\". Do not search the web or use "
+                     "other sources. If a tool returns no data, say so in the report instead of estimating.")
+    else:
+        lines.append("- Use only the content of this file. Do not run tools, search the web or read other files.")
+    if request.schema is not None:
+        lines.append("- The answer must be one JSON object that validates against the schema under "
+                     "\"Output format\". Write all prose inside the JSON string fields.")
+    if request.tools:
+        lines += ["", render_tools(request.tools, run_dir)]
+    if request.schema is not None:
+        schema = json.dumps(request.schema.model_json_schema(), ensure_ascii=False, indent=2)
+        lines += ["", "## Output format", "", "```json", schema, "```"]
+    lines += ["", "## Messages"]
+    for role, content in request.messages:
+        lines += ["", f"### {role}", "", content]
+    return "\n".join(lines) + "\n"
+
+
+def add_task(run_dir: Path, st: dict, node: str, request, kind: str, meta: dict | None = None) -> str:
+    st["seq"] += 1
+    task_id = f"{st['seq']:02d}-{slug(node)}"
+    tasks_dir = run_dir / "tasks"
+    tasks_dir.mkdir(exist_ok=True)
+    prompt_file = tasks_dir / f"{task_id}.prompt.md"
+    output_file = tasks_dir / f"{task_id}.response.md"
+    prompt_file.write_text(render_task(run_dir, node, request, output_file), encoding="utf-8")
+    tier = "quick" if kind == "reflection" else NODE_TIERS[node]
+    st["pending"][task_id] = {
+        "node": node, "kind": kind, "tier": tier,
+        "schema": request.schema.__name__ if request.schema is not None else None,
+        "uses_tools": bool(request.tools),
+        "prompt_file": str(prompt_file), "output_file": str(output_file),
+        "meta": meta or {}, "attempts": 0,
+    }
+    return task_id
+
+
+def describe_task(st: dict, task_id: str) -> dict:
+    task = st["pending"][task_id]
+    prompt = (
+        f"You are one agent in a TradingAgents research run. Read the task file {task['prompt_file']} "
+        f"and follow it exactly. Save only your final answer to {task['output_file']}. "
+        "When the file is saved, reply with the single word: done."
+    )
+    if task.get("error"):
+        prompt += f" A previous answer was rejected; fix this problem: {task['error']}"
+    return {
+        "id": task_id, "agent": task["node"], "tier": task["tier"],
+        "model": st["run"]["models"][task["tier"]], "uses_tools": task["uses_tools"],
+        "output_format": "json" if task["schema"] else "markdown",
+        "prompt_file": task["prompt_file"], "output_file": task["output_file"],
+        "subagent_prompt": prompt, **({"error": task["error"]} if task.get("error") else {}),
+    }
+
+
+def request_for(call):
+    """Run ``call`` expecting it to stop at an LLM call; return that request."""
+    from skill_llm import LLMRequest
+
+    try:
+        call()
+    except LLMRequest as request:
+        return request
+    raise RuntimeError("Upstream step finished without requesting a model response")
+
+
+# --------------------------------------------------------------------------
+# Graph steps
+# --------------------------------------------------------------------------
+
+
+def run_node(u, run: dict, node: str, state: dict, response: str | None) -> dict:
+    from skill_llm import SkillLLM
+
+    agent = u.factories[node](SkillLLM(response))
+    node_input = dict(state)
+    analyst = run["analyst_nodes"].get(node)
+    if analyst is not None:
+        node_input["messages"] = analyst_messages(u, run, state, analyst)
+    update = agent(node_input)
+    # Messages only feed the analyst tool loop, which the subagent runs itself.
+    return {key: value for key, value in update.items() if key not in ("messages", "sender")}
+
+
+def analyst_messages(u, run: dict, state: dict, analyst_key: str):
+    from langchain_core.messages import HumanMessage
+
+    # Upstream starts the first analyst with the ticker as the human message and
+    # every later analyst with the placeholder left by its message-clear node.
+    if run["analysts"][0] == analyst_key:
+        return [HumanMessage(content=state["company_of_interest"])]
+    return u.create_msg_delete()({**state, "messages": []})["messages"]
+
+
+def next_node(graph, node: str, state: dict) -> str | None:
+    """Edges from upstream GraphSetup.setup_graph."""
+    if node in DEBATE_NODES:
+        return graph.conditional_logic.should_continue_debate(state)
+    if node == "Research Manager":
+        return "Trader"
+    if node == "Trader":
+        return "Aggressive Analyst"
+    if node in RISK_NODES:
+        return graph.conditional_logic.should_continue_risk_analysis(state)
+    if node == "Portfolio Manager":
+        return None
+    raise ValueError(f"Unknown node: {node}")
+
+
+def prepare_reflections(u, graph, run_dir: Path, st: dict):
+    """Upstream ``_resolve_pending_entries`` up to its LLM call."""
+    from skill_llm import SkillLLM
+
+    run = st["run"]
+    ticker = run["ticker"]
+    pending = [e for e in graph.memory_log.get_pending_entries() if e["ticker"] == ticker]
+    if not pending:
+        return
+    benchmark = graph._resolve_benchmark(ticker)
+    for entry in pending:
+        raw, alpha, days, resolution_date = graph._fetch_returns(ticker, entry["date"], benchmark=benchmark)
+        if raw is None:
+            continue
+        meta = {"ticker": ticker, "trade_date": entry["date"], "raw_return": raw, "alpha_return": alpha,
+                "holding_days": days, "resolution_date": resolution_date,
+                "decision": entry.get("decision", ""), "benchmark": benchmark}
+        request = request_for(lambda: u.Reflector(SkillLLM()).reflect_on_final_decision(
+            final_decision=meta["decision"], raw_return=raw, alpha_return=alpha, benchmark_name=benchmark))
+        add_task(run_dir, st, f"Reflection {entry['date']}", request, "reflection", meta)
+
+
+def apply_reflections(u, graph, tasks: list[dict]):
+    from skill_llm import SkillLLM
+
+    updates = []
+    for task in tasks:
+        meta = task["meta"]
+        reflection = u.Reflector(SkillLLM(task["response"])).reflect_on_final_decision(
+            final_decision=meta["decision"], raw_return=meta["raw_return"],
+            alpha_return=meta["alpha_return"], benchmark_name=meta["benchmark"])
+        updates.append({key: meta[key] for key in
+                        ("ticker", "trade_date", "raw_return", "alpha_return", "holding_days", "resolution_date")}
+                       | {"reflection": reflection})
+    graph.memory_log.batch_update_with_outcomes(updates)
+
+
+def prepare_analysts(u, graph, run_dir: Path, st: dict):
+    """Upstream ``_run_graph`` initial state, then every selected analyst."""
+    run = st["run"]
+    ticker, trade_date = run["ticker"], run["trade_date"]
+    past_context = graph.memory_log.get_past_context(ticker, as_of=graph._memory_as_of(trade_date))
+    instrument_context = graph.resolve_instrument_context(ticker, run["asset_type"])
+    state = u.Propagator().create_initial_state(
+        ticker, trade_date, asset_type=run["asset_type"],
+        past_context=past_context, instrument_context=instrument_context)
+    state.pop("messages")
+    st["graph"] = state
+    # Analysts only read the shared inputs and write their own report key, so
+    # they run in parallel; upstream chains them only because LangGraph shares
+    # one message list between them.
+    for node in run["analyst_nodes"]:
+        request = request_for(lambda node=node: run_node(u, run, node, state, None))
+        add_task(run_dir, st, node, request, "analyst")
+
+
+def prepare_node(u, run_dir: Path, st: dict):
+    node = st["cursor"]
+    request = request_for(lambda: run_node(u, st["run"], node, st["graph"], None))
+    add_task(run_dir, st, node, request, "node")
+
+
+def finalize(u, graph, run_dir: Path, st: dict) -> dict:
+    """Upstream ``_run_graph`` after the graph: state log, memory, signal, reports."""
+    run, state = st["run"], st["graph"]
+    ticker, trade_date = run["ticker"], run["trade_date"]
+    reports = run_dir / "reports"
+    report = u.write_report_tree(state, ticker, reports)
+    decision = state["final_trade_decision"]
+    (reports / "final_decision.md").write_text(decision, encoding="utf-8")
+    graph.ticker = ticker
+    graph._log_state(trade_date, state)
+    graph.memory_log.store_decision(ticker=ticker, trade_date=trade_date, final_trade_decision=decision)
+    signal = u.SignalProcessor().process_signal(decision)
+    result = {
+        "status": "completed" if signal in RATINGS else "needs_review",
+        "signal": signal, "ticker": ticker, "analysis_date": trade_date, "asset_type": run["asset_type"],
+        "analysts": run["analysts"], "language": run["language"],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "report": str(report), "final_decision": str(reports / "final_decision.md"),
+        "historical_data_warning": trade_date < date.today().isoformat(),
+        "memory_log": graph.config.get("memory_log_path"),
+        "llm_tasks": st["seq"], "upstream": installed_source(),
+    }
+    write_json(run_dir / "result.json", result)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Step loop
+# --------------------------------------------------------------------------
+
+
+def ingest(u, st: dict, task_id: str, allow_freetext: bool) -> str:
+    """Return 'ok', 'missing' or 'rejected' for one pending task."""
+    from skill_llm import parse_structured
+
+    task = st["pending"][task_id]
+    if "response" in task:
+        return "ok"
+    path = Path(task["output_file"])
+    text = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    if not text:
+        return "missing"
+    if task["schema"] and not allow_freetext:
+        try:
+            parse_structured(getattr(u.schemas, task["schema"]), text)
+        except Exception as exc:  # noqa: BLE001 - report any parse/validation failure
+            task["attempts"] += 1
+            task["error"] = f"{type(exc).__name__}: {str(exc)[:1200]}"
+            path.replace(path.with_name(f"{path.stem}.rejected-{task['attempts']}.md"))
+            return "rejected"
+    task.pop("error", None)
+    task["response"] = text
+    return "ok"
+
+
+def apply_pending(u, graph, st: dict):
+    tasks = [st["pending"][task_id] | {"id": task_id} for task_id in sorted(st["pending"])]
+    kinds = {task["kind"] for task in tasks}
+    if kinds == {"reflection"}:
+        apply_reflections(u, graph, tasks)
+        st["phase"] = "analysts"
+    elif kinds == {"analyst"}:
+        for task in tasks:
+            st["graph"].update(run_node(u, st["run"], task["node"], st["graph"], task["response"]))
+        st["phase"], st["cursor"] = "graph", "Bull Researcher"
+    elif kinds == {"node"}:
+        (task,) = tasks
+        st["graph"].update(run_node(u, st["run"], task["node"], st["graph"], task["response"]))
+        st["cursor"] = next_node(graph, task["node"], st["graph"])
+        st["phase"] = "graph" if st["cursor"] else "finalize"
+    else:
+        raise RuntimeError(f"Unexpected pending task mix: {sorted(kinds)}")
+    st["completed"].extend({"id": task["id"], "agent": task["node"]} for task in tasks)
+    st["pending"] = {}
+
+
+def done_payload(run_dir: Path, result: dict) -> dict:
+    return {"status": "done", "run_dir": str(run_dir), "outcome": result["status"], "signal": result["signal"],
+            "result_file": str(run_dir / "result.json"), "final_decision": result["final_decision"],
+            "report": result["report"], "llm_tasks": result["llm_tasks"]}
+
+
+def step(run_dir: Path, allow_freetext: bool = False) -> dict:
+    u = load_upstream()
+    st = load_state(run_dir)
+    graph = graph_shell(u, build_config(u, st["config_overrides"]))
+    install_fetch_cache(run_dir)
+
+    if st["phase"] == "done":
+        return done_payload(run_dir, json.loads((run_dir / "result.json").read_text(encoding="utf-8")))
+
+    if st["pending"]:
+        outcomes = {task_id: ingest(u, st, task_id, allow_freetext) for task_id in sorted(st["pending"])}
+        waiting = [task_id for task_id, outcome in outcomes.items() if outcome != "ok"]
+        if waiting:
+            save_state(run_dir, st)
+            return {"status": "waiting", "run_dir": str(run_dir), "phase": st["phase"],
+                    "parallel": len(waiting) > 1, "tasks": [describe_task(st, t) for t in waiting]}
+        apply_pending(u, graph, st)
+        save_state(run_dir, st)
+
+    while True:
+        if st["phase"] == "start":
+            prepare_reflections(u, graph, run_dir, st)
+            st["phase"] = "reflect" if st["pending"] else "analysts"
+        elif st["phase"] == "analysts":
+            prepare_analysts(u, graph, run_dir, st)
+            st["phase"] = "analysts_wait"
+        elif st["phase"] == "graph":
+            prepare_node(u, run_dir, st)
+            st["phase"] = "graph_wait"
+        elif st["phase"] == "finalize":
+            result = finalize(u, graph, run_dir, st)
+            st["phase"] = "done"
+            save_state(run_dir, st)
+            return done_payload(run_dir, result)
+        save_state(run_dir, st)
+        if st["pending"]:
+            return {"status": "tasks", "run_dir": str(run_dir), "phase": st["phase"],
+                    "parallel": len(st["pending"]) > 1,
+                    "tasks": [describe_task(st, t) for t in sorted(st["pending"])]}
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def installed_source() -> dict:
+    try:
+        dist = metadata.distribution("tradingagents")
+    except metadata.PackageNotFoundError:
+        return {"installed": False, "verified_revision": False}
+    try:
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+    except (ValueError, TypeError):
+        direct = {}
+    commit = direct.get("vcs_info", {}).get("commit_id")
+    source_url = direct.get("url", "").removesuffix(".git").lower()
+    return {"installed": True, "version": dist.version, "commit": commit,
+            "verified_revision": commit == UPSTREAM_COMMIT and source_url == UPSTREAM_URL.lower()}
+
+
+def positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("doctor", help="Check the runtime without network or model calls")
+
+    init = commands.add_parser("init", help="Create a run and return its first tasks")
+    init.add_argument("--ticker", required=True)
+    init.add_argument("--date", default=date.today().isoformat(), help="YYYY-MM-DD, default today")
+    init.add_argument("--asset-type", choices=("stock", "crypto"), default="stock")
+    init.add_argument("--analysts", nargs="+", choices=ANALYSTS, default=list(ANALYSTS))
+    init.add_argument("--language", default=os.getenv("TRADINGAGENTS_OUTPUT_LANGUAGE") or "English")
+    init.add_argument("--debate-rounds", type=positive, default=1)
+    init.add_argument("--risk-rounds", type=positive, default=1)
+    init.add_argument("--data-vendor", choices=("yfinance", "alpha_vantage"), default="yfinance")
+    init.add_argument("--quick-model", default=DEFAULT_MODELS["quick"],
+                      help="Subagent model for upstream quick-think nodes")
+    init.add_argument("--deep-model", default=DEFAULT_MODELS["deep"],
+                      help="Subagent model for Research Manager and Portfolio Manager")
+    memory = init.add_mutually_exclusive_group()
+    memory.add_argument("--memory-log", type=Path, help="Decision log path (default: upstream)")
+    memory.add_argument("--no-memory", action="store_true", help="Do not read or write the decision log")
+    init.add_argument("--run-dir", type=Path)
+
+    for name, text in (("step", "Ingest saved answers and return the next tasks"),
+                       ("status", "Show run progress without advancing")):
+        sub = commands.add_parser(name, help=text)
+        sub.add_argument("--run-dir", type=Path, required=True)
+        if name == "step":
+            sub.add_argument("--allow-freetext", action="store_true",
+                             help="Accept invalid JSON as free text, like upstream's fallback")
+
+    tool = commands.add_parser("tool", help="Run an upstream data tool for an analyst task")
+    tool.add_argument("--run-dir", type=Path, required=True)
+    tool.add_argument("name")
+    tool.add_argument("params", nargs="*", metavar="name=value")
+    return parser
+
+
+def cmd_init(args) -> dict:
+    ticker = args.ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=\-]{0,39}", ticker) or ".." in ticker:
+        raise UsageError("Use a data-provider ticker such as NVDA, 7203.T or BTC-USD, not a name or path.")
+    try:
+        trade_date = date.fromisoformat(args.date)
+    except ValueError as exc:
+        raise UsageError("Date must be YYYY-MM-DD.") from exc
+    if trade_date > date.today():
+        raise UsageError("Future analysis dates are not supported.")
+    run_dir = (args.run_dir or DEFAULT_RUNS_DIR / f"{slug(ticker)}_{trade_date}_{datetime.now():%H%M%S}")
+    run_dir = run_dir.expanduser().resolve()
+    if run_dir.exists():
+        raise UsageError(f"Run directory already exists: {run_dir}")
+
+    u = load_upstream()
+    analysts = list(dict.fromkeys(args.analysts))
+    plan = u.build_analyst_execution_plan(analysts)
+    overrides = {
+        "output_language": args.language,
+        "max_debate_rounds": args.debate_rounds,
+        "max_risk_discuss_rounds": args.risk_rounds,
+        "results_dir": str(run_dir / "logs"),
+        "checkpoint_enabled": False,
+        "llm_provider": "skill-subagent",
+        "deep_think_llm": args.deep_model,
+        "quick_think_llm": args.quick_model,
+    }
+    if args.data_vendor != "yfinance":
+        overrides["data_vendors"] = {key: args.data_vendor for key in
+                                     ("core_stock_apis", "technical_indicators", "fundamental_data", "news_data")}
+    if args.no_memory:
+        overrides["memory_log_path"] = None
+    elif args.memory_log:
+        overrides["memory_log_path"] = str(args.memory_log.expanduser().resolve())
+
+    run_dir.mkdir(parents=True)
+    st = {
+        "version": 1,
+        "run": {
+            "ticker": ticker, "trade_date": trade_date.isoformat(), "asset_type": args.asset_type,
+            "analysts": analysts, "language": args.language,
+            "analyst_nodes": {spec.agent_node: spec.key for spec in plan.specs},
+            "models": {"quick": args.quick_model, "deep": args.deep_model},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "config_overrides": overrides,
+        "phase": "start", "seq": 0, "pending": {}, "completed": [], "graph": {}, "cursor": None,
+    }
+    save_state(run_dir, st)
+    return step(run_dir)
+
+
+def cmd_status(args) -> dict:
+    run_dir = args.run_dir.expanduser().resolve()
+    st = load_state(run_dir)
+    return {"status": "done" if st["phase"] == "done" else "in_progress", "run_dir": str(run_dir),
+            "phase": st["phase"], "run": st["run"], "completed": st["completed"],
+            "tasks": [describe_task(st, t) for t in sorted(st["pending"])]}
+
+
+def parse_params(params: list[str]) -> dict:
+    values = {}
+    for item in params:
+        name, sep, raw = item.partition("=")
+        if not sep or not name:
+            raise UsageError(f"Tool arguments use name=value, got {item!r}")
+        try:
+            values[name] = json.loads(raw)
+        except ValueError:
+            values[name] = raw
+        if not isinstance(values[name], (int, float, bool, type(None))):
+            values[name] = raw
+    return values
+
+
+def cmd_tool(args) -> int:
+    run_dir = args.run_dir.expanduser().resolve()
+    st = load_state(run_dir)
+    u = load_upstream()
+    u.set_config(build_config(u, st["config_overrides"]))
+    tools = all_tools(u)
+    if args.name not in tools:
+        raise UsageError(f"Unknown tool {args.name!r}; available: {', '.join(sorted(tools))}")
+    params = parse_params(args.params)
+    log = run_dir / "logs" / "tool_calls.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc)
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            output = tools[args.name].invoke(params)
+        ok = True
+    except Exception as exc:  # noqa: BLE001 - the agent should see any tool failure
+        output, ok = f"TOOL_ERROR: {type(exc).__name__}: {exc}", False
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"at": started.isoformat(), "tool": args.name, "args": params,
+                                 "ok": ok, "chars": len(str(output))}, ensure_ascii=False) + "\n")
+    print(output)
+    return 0 if ok else 1
+
+
+def cmd_doctor() -> dict:
+    source = installed_source()
+    result = {"python": sys.version.split()[0], "python_ok": sys.version_info >= (3, 10),
+              "upstream": source, "fred_api_key_present": bool(os.getenv("FRED_API_KEY")),
+              "alpha_vantage_api_key_present": bool(os.getenv("ALPHA_VANTAGE_API_KEY"))}
+    if source["installed"]:
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                u = load_upstream()
+                result["tools"] = sorted(all_tools(u))
+            result["import_ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            result["import_ok"], result["import_error"] = False, f"{type(exc).__name__}: {exc}"
+    result["ready"] = bool(result["python_ok"] and source["verified_revision"] and result.get("import_ok"))
+    return result
+
+
+def emit(value: dict):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "tool":
+            return cmd_tool(args)
+        if args.command == "doctor":
+            result = cmd_doctor()
+            emit(result)
+            return 0 if result["ready"] else 2
+        # Upstream data libraries print progress to stdout; keep stdout pure JSON.
+        with contextlib.redirect_stdout(sys.stderr):
+            if args.command == "init":
+                result = cmd_init(args)
+            elif args.command == "step":
+                result = step(args.run_dir.expanduser().resolve(), args.allow_freetext)
+            else:
+                result = cmd_status(args)
+    except UsageError as exc:
+        emit({"status": "error", "error": str(exc)})
+        return 2
+    except Exception as exc:  # noqa: BLE001 - surface failures as JSON for the orchestrator
+        emit({"status": "failed", "error_type": type(exc).__name__, "error": str(exc)[:2000]})
+        return 1
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
