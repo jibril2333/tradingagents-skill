@@ -51,9 +51,9 @@ skills/tradingagents/scripts/ta doctor
 
 > 用 TradingAgents 分析 NVDA，日期今天，输出中文报告。
 
-skill 会依次执行 `ta init`、派发子代理、`ta step`，完成后读取 `result.json` 与最终决策并总结。结果保存在上游 CLI 的同一位置：`~/.tradingagents/logs/TICKER/日期/`（可用 `TRADINGAGENTS_RESULTS_DIR` 覆盖）。
+skill 会依次执行 `ta init`、派发子代理、`ta step`，完成后读取 `result.json` 与最终决策并总结。输出与上游 CLI 相同：`~/.tradingagents/logs/TICKER/日期/` 下的分节报告与 `message_tool.log`，以及当前目录 `reports/TICKER_时间戳/` 下的完整报告树；另有 `propagate()` 的状态日志与记忆日志。
 
-不带参数时的行为与上游默认一致：代码归一化、按 ticker 判定资产类型（加密货币自动去掉基本面分析师）、分析师全选、辩论与风险讨论各 1 轮、英文输出、yfinance 数据源、跨运行记忆日志。常用参数：`--research-depth`（对应上游 CLI 的 1/3/5 档，同时设置两个轮数）、`--analysts`、`--quick-model`、`--deep-model`、`--language`、`--no-memory`。完整说明见 [SKILL.md](skills/tradingagents/SKILL.md) 与 [setup.md](skills/tradingagents/references/setup.md)。
+不带参数时的行为与上游默认一致：代码归一化、按 ticker 判定资产类型（加密货币自动去掉基本面分析师）、分析师全选、辩论与风险讨论各 1 轮、英文输出、yfinance 数据源、跨运行记忆日志。数据工具经上游 `ToolNode` 执行，报错规则与上游相同；其他上游配置项可用 `--config` 传入。常用参数：`--research-depth`（对应上游 CLI 的 1/3/5 档，同时设置两个轮数）、`--analysts`、`--quick-model`、`--deep-model`、`--language`、`--no-memory`。完整说明见 [SKILL.md](skills/tradingagents/SKILL.md) 与 [setup.md](skills/tradingagents/references/setup.md)。
 
 ## 额度
 

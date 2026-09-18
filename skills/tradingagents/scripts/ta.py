@@ -20,6 +20,8 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+import uuid
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from importlib import metadata
@@ -27,6 +29,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import cli_mirror  # noqa: E402
 
 UPSTREAM_COMMIT = "be952b8eccb49720509af544c6675233bc1f10d0"
 UPSTREAM_URL = "https://github.com/TauricResearch/TradingAgents"
@@ -64,7 +68,13 @@ def load_upstream():
     # cli.utils holds the symbol/asset-type behaviour the upstream CLI applies
     # before a run; reusing it keeps this skill's defaults identical.
     from cli.models import AnalystType, AssetType
-    from cli.utils import detect_asset_type, filter_analysts_for_asset_type, normalize_ticker_symbol
+    from cli.utils import (
+        ANALYST_ORDER,
+        detect_asset_type,
+        filter_analysts_for_asset_type,
+        is_valid_ticker_input,
+        normalize_ticker_symbol,
+    )
     from tradingagents import agents
     from tradingagents.agents import schemas
     from tradingagents.dataflows.utils import safe_ticker_component
@@ -98,6 +108,7 @@ def load_upstream():
         AnalystType=AnalystType, AssetType=AssetType, detect_asset_type=detect_asset_type,
         filter_analysts_for_asset_type=filter_analysts_for_asset_type,
         normalize_ticker_symbol=normalize_ticker_symbol, safe_ticker_component=safe_ticker_component,
+        is_valid_ticker_input=is_valid_ticker_input, ANALYST_ORDER=ANALYST_ORDER,
         factories=factories, schemas=schemas, create_msg_delete=create_msg_delete,
         TradingMemoryLog=TradingMemoryLog, set_config=set_config, DEFAULT_CONFIG=DEFAULT_CONFIG,
         build_analyst_execution_plan=build_analyst_execution_plan,
@@ -108,10 +119,13 @@ def load_upstream():
 
 
 def build_config(u, overrides: dict) -> dict:
+    """DEFAULT_CONFIG plus overrides; dict values merge one level deep, as in upstream set_config."""
     config = deepcopy(u.DEFAULT_CONFIG)
-    overrides = deepcopy(overrides)
-    config.setdefault("data_vendors", {}).update(overrides.pop("data_vendors", {}))
-    config.update(overrides)
+    for key, value in deepcopy(overrides).items():
+        if isinstance(value, dict) and isinstance(config.get(key), dict):
+            config[key].update(value)
+        else:
+            config[key] = value
     return config
 
 
@@ -216,8 +230,8 @@ def command_prefix(*parts: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def render_tools(tools, run_dir: Path) -> str:
-    prefix = command_prefix("tool", "--run-dir", str(run_dir))
+def render_tools(tools, run_dir: Path, task_id: str) -> str:
+    prefix = command_prefix("tool", "--run-dir", str(run_dir), "--task", task_id)
     lines = [
         "## Data tools",
         "",
@@ -245,7 +259,7 @@ def render_tools(tools, run_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def render_task(run_dir: Path, node: str, request, output_file: Path) -> str:
+def render_task(run_dir: Path, node: str, request, output_file: Path, task_id: str) -> str:
     lines = [
         f"# TradingAgents task: {node}",
         "",
@@ -260,13 +274,15 @@ def render_task(run_dir: Path, node: str, request, output_file: Path) -> str:
     if request.tools:
         lines.append("- Get data only through the tools under \"Data tools\". Do not search the web or use "
                      "other sources. If a tool returns no data, say so in the report instead of estimating.")
+        lines.append("- If a tool prints `RUN_FAILED`, stop: do not write the answer file, and reply with "
+                     "the single word: failed.")
     else:
         lines.append("- Use only the content of this file. Do not run tools, search the web or read other files.")
     if request.schema is not None:
         lines.append("- The answer must be one JSON object that validates against the schema under "
                      "\"Output format\". Write all prose inside the JSON string fields.")
     if request.tools:
-        lines += ["", render_tools(request.tools, run_dir)]
+        lines += ["", render_tools(request.tools, run_dir, task_id)]
     if request.schema is not None:
         schema = json.dumps(request.schema.model_json_schema(), ensure_ascii=False, indent=2)
         lines += ["", "## Output format", "", "```json", schema, "```"]
@@ -283,16 +299,26 @@ def add_task(run_dir: Path, st: dict, node: str, request, kind: str, meta: dict 
     tasks_dir.mkdir(exist_ok=True)
     prompt_file = tasks_dir / f"{task_id}.prompt.md"
     output_file = tasks_dir / f"{task_id}.response.md"
-    prompt_file.write_text(render_task(run_dir, node, request, output_file), encoding="utf-8")
+    prompt_file.write_text(render_task(run_dir, node, request, output_file, task_id), encoding="utf-8")
     tier = "quick" if kind == "reflection" else NODE_TIERS[node]
     st["pending"][task_id] = {
         "node": node, "kind": kind, "tier": tier,
         "schema": request.schema.__name__ if request.schema is not None else None,
         "uses_tools": bool(request.tools),
         "prompt_file": str(prompt_file), "output_file": str(output_file),
-        "meta": meta or {}, "attempts": 0,
+        "meta": meta or {}, "attempts": 0, "generation": 0, "created_at": time.time(),
     }
     return task_id
+
+
+def rewrite_as_freetext(u, run_dir: Path, st: dict, task_id: str):
+    """Upstream ``invoke_structured_or_freetext`` fallback: same prompt, plain answer."""
+    task = st["pending"][task_id]
+    request = request_for(lambda: run_node(u, st["run"], task["node"], st["graph"], None)[0])
+    request.schema = None
+    prompt_file, output_file = Path(task["prompt_file"]), Path(task["output_file"])
+    prompt_file.write_text(render_task(run_dir, task["node"], request, output_file, task_id), encoding="utf-8")
+    task["fallback_from"], task["schema"] = task["schema"], None
 
 
 def describe_task(st: dict, task_id: str) -> dict:
@@ -329,7 +355,8 @@ def request_for(call):
 # --------------------------------------------------------------------------
 
 
-def run_node(u, run: dict, node: str, state: dict, response: str | None) -> dict:
+def run_node(u, run: dict, node: str, state: dict, response: str | None) -> tuple[dict, list]:
+    """Run one upstream node; return its state update and the messages it emitted."""
     from skill_llm import SkillLLM
 
     agent = u.factories[node](SkillLLM(response))
@@ -338,8 +365,10 @@ def run_node(u, run: dict, node: str, state: dict, response: str | None) -> dict
     if analyst is not None:
         node_input["messages"] = analyst_messages(u, run, state, analyst)
     update = agent(node_input)
-    # Messages only feed the analyst tool loop, which the subagent runs itself.
-    return {key: value for key, value in update.items() if key not in ("messages", "sender")}
+    # Messages only feed the analyst tool loop, which the subagent runs itself;
+    # they are returned for message_tool.log instead of being kept in state.
+    messages = list(update.get("messages") or [])
+    return {key: value for key, value in update.items() if key not in ("messages", "sender")}, messages
 
 
 def analyst_messages(u, run: dict, state: dict, analyst_key: str):
@@ -421,6 +450,10 @@ def prepare_analysts(u, graph, run_dir: Path, st: dict):
     for node in run["analyst_nodes"]:
         request = request_for(lambda node=node: run_node(u, run, node, state, None))
         add_task(run_dir, st, node, request, "analyst")
+    # The initial graph input the CLI logs before the first analyst starts.
+    from langchain_core.messages import HumanMessage
+
+    cli_mirror.log_langchain_message(run_dir, HumanMessage(content=ticker))
 
 
 def prepare_node(u, run_dir: Path, st: dict):
@@ -429,30 +462,65 @@ def prepare_node(u, run_dir: Path, st: dict):
     add_task(run_dir, st, node, request, "node")
 
 
+def analyst_wall_time_summary(u, run: dict, timings: dict) -> str:
+    """The CLI's ``AnalystWallTimeTracker`` summary from recorded task times."""
+    from tradingagents.graph.analyst_execution import AnalystWallTimeTracker
+
+    tracker = AnalystWallTimeTracker(u.build_analyst_execution_plan(run["analysts"]))
+    for node, key in run["analyst_nodes"].items():
+        if node in timings:
+            started, finished = timings[node]
+            tracker.mark_started(key, started_at=started)
+            tracker.mark_completed(key, completed_at=finished)
+    return tracker.format_summary()
+
+
 def finalize(u, graph, run_dir: Path, st: dict) -> dict:
-    """Upstream ``_run_graph`` after the graph: state log, memory, signal, reports."""
+    """End of a run: upstream ``_run_graph`` bookkeeping plus the CLI's outputs."""
     run, state = st["run"], st["graph"]
     ticker, trade_date = run["ticker"], run["trade_date"]
-    reports = run_dir / "reports"
-    report = u.write_report_tree(state, ticker, reports)
+
+    # propagate(): state log, decision log entry, signal.
     decision = state["final_trade_decision"]
-    (reports / "final_decision.md").write_text(decision, encoding="utf-8")
     graph.ticker = ticker
     graph._log_state(trade_date, state)
     graph.memory_log.store_decision(ticker=ticker, trade_date=trade_date, final_trade_decision=decision)
     signal = u.SignalProcessor().process_signal(decision)
+
+    # CLI: final section files, completion messages, then "Save report?" (default yes)
+    # to ./reports/TICKER_YYYYmmdd_HHMMSS relative to where the run was started.
+    cli_mirror.mirror_final(run_dir, run["analysts"], state)
+    cli_mirror.log_message(run_dir, "System", f"Completed analysis for {trade_date}")
+    wall_times = analyst_wall_time_summary(u, run, st["timings"])
+    cli_mirror.log_message(run_dir, "System", wall_times)
+    report = None
+    if run["save_dir"]:
+        save_path = Path(run["save_dir"]) / f"{ticker}_{datetime.now():%Y%m%d_%H%M%S}"
+        report = str(u.write_report_tree(state, ticker, save_path))
+
     result = {
         "status": "completed" if signal in RATINGS else "needs_review",
         "signal": signal, "ticker": ticker, "analysis_date": trade_date, "asset_type": run["asset_type"],
         "analysts": run["analysts"], "language": run["language"],
+        "debate_rounds": run["debate_rounds"], "risk_rounds": run["risk_rounds"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "report": str(report), "final_decision": str(reports / "final_decision.md"),
+        "report": report, "reports_dir": str(run_dir / "reports"),
+        "final_decision": str(run_dir / "reports" / "final_trade_decision.md"),
+        "message_log": str(run_dir / "message_tool.log"),
+        "state_log": str(Path(graph.config["results_dir"]) / u.safe_ticker_component(ticker)
+                         / "TradingAgentsStrategy_logs" / f"full_states_log_{trade_date}.json"),
         "historical_data_warning": trade_date < date.today().isoformat(),
         "memory_log": graph.config.get("memory_log_path"),
-        "llm_tasks": st["seq"], "upstream": installed_source(),
+        "analyst_wall_time": wall_times, "llm_tasks": st["seq"], "tool_calls": count_tool_calls(run_dir),
+        "upstream": installed_source(),
     }
     write_json(run_dir / "result.json", result)
     return result
+
+
+def count_tool_calls(run_dir: Path) -> int:
+    log = run_dir / "logs" / "tool_calls.jsonl"
+    return sum(1 for _ in log.open(encoding="utf-8")) if log.is_file() else 0
 
 
 # --------------------------------------------------------------------------
@@ -460,8 +528,15 @@ def finalize(u, graph, run_dir: Path, st: dict) -> dict:
 # --------------------------------------------------------------------------
 
 
-def ingest(u, st: dict, task_id: str, allow_freetext: bool) -> str:
-    """Return 'ok', 'missing' or 'rejected' for one pending task."""
+def ingest(u, run_dir: Path, st: dict, task_id: str, allow_freetext: bool) -> str:
+    """Return 'ok', 'missing' or 'rejected' for one pending task.
+
+    A structured answer that fails the upstream schema gets one correction
+    attempt (the role a provider's native structured output plays). After that
+    the task follows upstream ``invoke_structured_or_freetext``: the same
+    prompt is asked again for a plain-text answer, which the node then renders
+    through its free-text path.
+    """
     from skill_llm import parse_structured
 
     task = st["pending"][task_id]
@@ -476,15 +551,52 @@ def ingest(u, st: dict, task_id: str, allow_freetext: bool) -> str:
             parse_structured(getattr(u.schemas, task["schema"]), text)
         except Exception as exc:  # noqa: BLE001 - report any parse/validation failure
             task["attempts"] += 1
-            task["error"] = f"{type(exc).__name__}: {str(exc)[:1200]}"
             path.replace(path.with_name(f"{path.stem}.rejected-{task['attempts']}.md"))
+            if task["attempts"] == 1:
+                task["error"] = f"{type(exc).__name__}: {str(exc)[:1200]}"
+            else:
+                rewrite_as_freetext(u, run_dir, st, task_id)
+                task["error"] = ("The JSON answer failed validation again. The task file now asks for a "
+                                 "plain-text answer (the upstream free-text fallback); reread it.")
             return "rejected"
     task.pop("error", None)
     task["response"] = text
+    task["answered_at"] = path.stat().st_mtime
     return "ok"
 
 
-def apply_pending(u, graph, st: dict):
+def load_failures(run_dir: Path) -> list[dict]:
+    path = run_dir / "logs" / "tool_failures.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def failed_tasks(run_dir: Path, st: dict) -> dict:
+    """Pending tasks whose current attempt hit a tool exception."""
+    failures = {}
+    for failure in load_failures(run_dir):
+        task = st["pending"].get(failure["task"])
+        if task is not None and failure["generation"] == task["generation"]:
+            failures[failure["task"]] = failure
+    return failures
+
+
+def apply_node(u, run_dir: Path, st: dict, node: str, response: str):
+    """Apply one answered node and mirror what the CLI stream loop records."""
+    run = st["run"]
+    update, messages = run_node(u, run, node, st["graph"], response)
+    st["graph"].update(update)
+    for message in messages:
+        cli_mirror.log_langchain_message(run_dir, message)
+    if node in run["analyst_nodes"]:
+        # The analyst's message-clear node leaves the CLI's next user placeholder.
+        for message in u.create_msg_delete()({**st["graph"], "messages": []})["messages"]:
+            cli_mirror.log_langchain_message(run_dir, message)
+    cli_mirror.mirror_chunk(run_dir, run["analysts"], st["graph"])
+
+
+def apply_pending(u, graph, run_dir: Path, st: dict):
     tasks = [st["pending"][task_id] | {"id": task_id} for task_id in sorted(st["pending"])]
     kinds = {task["kind"] for task in tasks}
     if kinds == {"reflection"}:
@@ -492,15 +604,17 @@ def apply_pending(u, graph, st: dict):
         st["phase"] = "analysts"
     elif kinds == {"analyst"}:
         for task in tasks:
-            st["graph"].update(run_node(u, st["run"], task["node"], st["graph"], task["response"]))
+            apply_node(u, run_dir, st, task["node"], task["response"])
         st["phase"], st["cursor"] = "graph", "Bull Researcher"
     elif kinds == {"node"}:
         (task,) = tasks
-        st["graph"].update(run_node(u, st["run"], task["node"], st["graph"], task["response"]))
+        apply_node(u, run_dir, st, task["node"], task["response"])
         st["cursor"] = next_node(graph, task["node"], st["graph"])
         st["phase"] = "graph" if st["cursor"] else "finalize"
     else:
         raise RuntimeError(f"Unexpected pending task mix: {sorted(kinds)}")
+    for task in tasks:
+        st["timings"][task["node"]] = [task["created_at"], task.get("answered_at", time.time())]
     st["completed"].extend({"id": task["id"], "agent": task["node"]} for task in tasks)
     st["pending"] = {}
 
@@ -508,10 +622,11 @@ def apply_pending(u, graph, st: dict):
 def done_payload(run_dir: Path, result: dict) -> dict:
     return {"status": "done", "run_dir": str(run_dir), "outcome": result["status"], "signal": result["signal"],
             "result_file": str(run_dir / "result.json"), "final_decision": result["final_decision"],
-            "report": result["report"], "llm_tasks": result["llm_tasks"]}
+            "report": result["report"], "reports_dir": result["reports_dir"],
+            "analyst_wall_time": result["analyst_wall_time"], "llm_tasks": result["llm_tasks"]}
 
 
-def step(run_dir: Path, allow_freetext: bool = False) -> dict:
+def step(run_dir: Path, allow_freetext: bool = False, retry: bool = False) -> dict:
     u = load_upstream()
     st = load_state(run_dir)
     graph = graph_shell(u, build_config(u, st["config_overrides"]))
@@ -520,14 +635,32 @@ def step(run_dir: Path, allow_freetext: bool = False) -> dict:
     if st["phase"] == "done":
         return done_payload(run_dir, json.loads((run_dir / "result.json").read_text(encoding="utf-8")))
 
+    failures = failed_tasks(run_dir, st)
+    if failures and not retry:
+        # Upstream ToolNode re-raises data-vendor exceptions, which aborts the run.
+        first = failures[sorted(failures)[0]]
+        return {"status": "failed", "run_dir": str(run_dir), "error_type": first["error_type"],
+                "error": first["error"], "failed_tasks": sorted(failures),
+                "hint": "A data tool raised, which stops an upstream run. Resume with `step --retry`, "
+                        "which reruns the affected tasks from the start."}
+    for task_id in failures:
+        task = st["pending"][task_id]
+        task["generation"] += 1
+        task["created_at"] = time.time()
+        output = Path(task["output_file"])
+        if output.exists():
+            output.replace(output.with_name(f"{output.stem}.failed-{task['generation']}.md"))
+    if failures:
+        save_state(run_dir, st)
+
     if st["pending"]:
-        outcomes = {task_id: ingest(u, st, task_id, allow_freetext) for task_id in sorted(st["pending"])}
+        outcomes = {task_id: ingest(u, run_dir, st, task_id, allow_freetext) for task_id in sorted(st["pending"])}
         waiting = [task_id for task_id, outcome in outcomes.items() if outcome != "ok"]
         if waiting:
             save_state(run_dir, st)
             return {"status": "waiting", "run_dir": str(run_dir), "phase": st["phase"],
                     "parallel": len(waiting) > 1, "tasks": [describe_task(st, t) for t in waiting]}
-        apply_pending(u, graph, st)
+        apply_pending(u, graph, run_dir, st)
         save_state(run_dir, st)
 
     while True:
@@ -572,6 +705,19 @@ def installed_source() -> dict:
             "verified_revision": commit == UPSTREAM_COMMIT and source_url == UPSTREAM_URL.lower()}
 
 
+def load_config_file(path: Path | None) -> dict:
+    """Upstream config overrides from a JSON file, as a Python caller would set them."""
+    if path is None:
+        return {}
+    try:
+        value = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"Cannot read config file {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise UsageError("The config file must contain a JSON object of upstream config keys.")
+    return value
+
+
 def _depth_round(research_depth: int | None, env_var: str) -> int | None:
     """Research depth applies unless the matching upstream env override is set."""
     return None if os.environ.get(env_var) else research_depth
@@ -591,18 +737,23 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor", help="Check the runtime without network or model calls")
 
     init = commands.add_parser("init", help="Create a run and return its first tasks")
-    init.add_argument("--ticker", required=True)
+    init.add_argument("--ticker", default="", help="Default: SPY, as the upstream CLI")
     init.add_argument("--date", default=date.today().isoformat(), help="YYYY-MM-DD, default today")
     init.add_argument("--asset-type", choices=("stock", "crypto"),
                       help="Default: detected from the ticker, as the upstream CLI does")
     init.add_argument("--analysts", nargs="+", choices=ANALYSTS, default=list(ANALYSTS),
                       help="Upstream drops the fundamentals analyst for crypto")
-    init.add_argument("--language", default=os.getenv("TRADINGAGENTS_OUTPUT_LANGUAGE") or "English")
+    init.add_argument("--language", help="Default: upstream output_language (English, or "
+                                         "TRADINGAGENTS_OUTPUT_LANGUAGE from the environment or .env)")
     init.add_argument("--research-depth", type=positive,
                       help="Upstream depth: sets both round counts (CLI offers 1, 3, 5)")
     init.add_argument("--debate-rounds", type=positive)
     init.add_argument("--risk-rounds", type=positive)
-    init.add_argument("--data-vendor", choices=("yfinance", "alpha_vantage"), default="yfinance")
+    init.add_argument("--config", type=Path,
+                      help="JSON object of upstream config keys (data_vendors, tool_vendors, news limits, "
+                           "benchmark, results_dir, ...), merged over DEFAULT_CONFIG like the Python API")
+    init.add_argument("--data-vendor", choices=("yfinance", "alpha_vantage"),
+                      help="Shortcut: use one vendor for prices, indicators, fundamentals and news")
     init.add_argument("--quick-model", default=DEFAULT_MODELS["quick"],
                       help="Subagent model for upstream quick-think nodes")
     init.add_argument("--deep-model", default=DEFAULT_MODELS["deep"],
@@ -612,6 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
     memory.add_argument("--no-memory", action="store_true", help="Do not read or write the decision log")
     init.add_argument("--run-dir", type=Path,
                       help="Default: RESULTS_DIR/TICKER/DATE, the upstream CLI layout")
+    save = init.add_mutually_exclusive_group()
+    save.add_argument("--save-dir", type=Path,
+                      help="Where the final report tree is saved as TICKER_YYYYmmdd_HHMMSS "
+                           "(default: ./reports, the upstream CLI's 'Save report' default)")
+    save.add_argument("--no-save", action="store_true", help="Skip saving the report tree")
 
     for name, text in (("step", "Ingest saved answers and return the next tasks"),
                        ("status", "Show run progress without advancing")):
@@ -619,10 +775,13 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--run-dir", type=Path, required=True)
         if name == "step":
             sub.add_argument("--allow-freetext", action="store_true",
-                             help="Accept invalid JSON as free text, like upstream's fallback")
+                             help="Accept invalid JSON now as upstream's free-text fallback")
+            sub.add_argument("--retry", action="store_true",
+                             help="Rerun tasks stopped by a data tool exception")
 
     tool = commands.add_parser("tool", help="Run an upstream data tool for an analyst task")
     tool.add_argument("--run-dir", type=Path, required=True)
+    tool.add_argument("--task", help="Analyst task id; limits tools to that analyst's upstream ToolNode")
     tool.add_argument("name")
     tool.add_argument("params", nargs="*", metavar="name=value")
     return parser
@@ -632,9 +791,13 @@ def cmd_init(args) -> dict:
     u = load_upstream()
     # Upstream CLI order: normalise the symbol, classify the asset from the
     # canonical form, then drop analysts that do not apply to it.
-    ticker = u.normalize_ticker_symbol(args.ticker)
-    if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=\-]{0,39}", ticker) or ".." in ticker:
-        raise UsageError("Use a data-provider ticker such as NVDA, 7203.T or BTC-USD, not a name or path.")
+    if not u.is_valid_ticker_input(args.ticker):
+        raise UsageError("Please enter a valid ticker symbol, e.g. AAPL, 000404.SZ, 0700.HK, GC=F.")
+    ticker = u.normalize_ticker_symbol(args.ticker) if args.ticker.strip() else "SPY"
+    try:
+        u.safe_ticker_component(ticker)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
     try:
         trade_date = date.fromisoformat(args.date)
     except ValueError as exc:
@@ -643,7 +806,8 @@ def cmd_init(args) -> dict:
         raise UsageError("Future analysis dates are not supported.")
 
     asset_type = args.asset_type or u.detect_asset_type(ticker).value
-    requested = list(dict.fromkeys(args.analysts))
+    # The CLI checkbox returns analysts in its fixed ANALYST_ORDER.
+    requested = [key.value for _, key in u.ANALYST_ORDER if key.value in args.analysts]
     analysts = [analyst.value for analyst in u.filter_analysts_for_asset_type(
         [u.AnalystType(key) for key in requested], u.AssetType(asset_type))]
     dropped = [key for key in requested if key not in analysts]
@@ -651,24 +815,31 @@ def cmd_init(args) -> dict:
         raise UsageError(f"No analyst applies to a {asset_type} run; upstream drops {', '.join(dropped)}.")
     plan = u.build_analyst_execution_plan(analysts)
 
-    # Upstream research depth sets both round counts, and an environment
-    # override wins over it; explicit flags win over both.
-    debate_rounds = args.debate_rounds or _depth_round(args.research_depth, "TRADINGAGENTS_MAX_DEBATE_ROUNDS") \
-        or u.DEFAULT_CONFIG["max_debate_rounds"]
-    risk_rounds = args.risk_rounds or _depth_round(args.research_depth, "TRADINGAGENTS_MAX_RISK_ROUNDS") \
-        or u.DEFAULT_CONFIG["max_risk_discuss_rounds"]
+    file_config = load_config_file(args.config)
+
+    # Round counts: explicit flags, then research depth (which an upstream env
+    # override suppresses, as in the CLI), then the config file, then
+    # DEFAULT_CONFIG (which already carries env overrides).
+    debate_rounds = (args.debate_rounds or _depth_round(args.research_depth, "TRADINGAGENTS_MAX_DEBATE_ROUNDS")
+                     or file_config.get("max_debate_rounds") or u.DEFAULT_CONFIG["max_debate_rounds"])
+    risk_rounds = (args.risk_rounds or _depth_round(args.research_depth, "TRADINGAGENTS_MAX_RISK_ROUNDS")
+                   or file_config.get("max_risk_discuss_rounds") or u.DEFAULT_CONFIG["max_risk_discuss_rounds"])
 
     # Same layout the upstream CLI writes: results_dir/TICKER/DATE, with the
-    # report tree inside it and the state log under results_dir/TICKER.
-    default_dir = (Path(u.DEFAULT_CONFIG["results_dir"]) / u.safe_ticker_component(ticker)
-                   / trade_date.isoformat())
+    # section reports and message log inside it and the state log under
+    # results_dir/TICKER.
+    results_dir = file_config.get("results_dir") or u.DEFAULT_CONFIG["results_dir"]
+    default_dir = Path(results_dir).expanduser() / u.safe_ticker_component(ticker) / trade_date.isoformat()
     run_dir = (args.run_dir or default_dir).expanduser().resolve()
     if run_dir.exists():
         raise UsageError(f"Run directory already exists: {run_dir}. Continue it with "
                          f"`step --run-dir`, or start a separate run with `--run-dir`.")
 
+    language = args.language or file_config.get("output_language") or u.DEFAULT_CONFIG["output_language"]
+    save_dir = None if args.no_save else str((args.save_dir or Path.cwd() / "reports").expanduser().resolve())
     overrides = {
-        "output_language": args.language,
+        **file_config,
+        "output_language": language,
         "max_debate_rounds": debate_rounds,
         "max_risk_discuss_rounds": risk_rounds,
         "checkpoint_enabled": False,
@@ -676,9 +847,10 @@ def cmd_init(args) -> dict:
         "deep_think_llm": args.deep_model,
         "quick_think_llm": args.quick_model,
     }
-    if args.data_vendor != "yfinance":
-        overrides["data_vendors"] = {key: args.data_vendor for key in
-                                     ("core_stock_apis", "technical_indicators", "fundamental_data", "news_data")}
+    if args.data_vendor:
+        overrides["data_vendors"] = {**file_config.get("data_vendors", {}), **{
+            key: args.data_vendor for key in
+            ("core_stock_apis", "technical_indicators", "fundamental_data", "news_data")}}
     if args.no_memory:
         overrides["memory_log_path"] = None
     elif args.memory_log:
@@ -690,16 +862,24 @@ def cmd_init(args) -> dict:
         "run": {
             "ticker": ticker, "trade_date": trade_date.isoformat(), "asset_type": asset_type,
             "asset_type_detected": args.asset_type is None,
-            "analysts": analysts, "dropped_analysts": dropped, "language": args.language,
+            "analysts": analysts, "dropped_analysts": dropped, "language": language,
             "debate_rounds": debate_rounds, "risk_rounds": risk_rounds,
             "analyst_nodes": {spec.agent_node: spec.key for spec in plan.specs},
             "models": {"quick": args.quick_model, "deep": args.deep_model},
+            "save_dir": save_dir,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
         "config_overrides": overrides,
         "phase": "start", "seq": 0, "pending": {}, "completed": [], "graph": {}, "cursor": None,
+        "timings": {},
     }
     save_state(run_dir, st)
+    # The CLI's opening System messages.
+    cli_mirror.log_message(run_dir, "System", f"Selected ticker: {ticker}")
+    if asset_type != "stock":
+        cli_mirror.log_message(run_dir, "System", f"Detected asset type: {asset_type}")
+    cli_mirror.log_message(run_dir, "System", f"Analysis date: {trade_date.isoformat()}")
+    cli_mirror.log_message(run_dir, "System", f"Selected analysts: {', '.join(analysts)}")
     return step(run_dir)
 
 
@@ -726,29 +906,68 @@ def parse_params(params: list[str]) -> dict:
     return values
 
 
+def tool_node_for(u, st: dict, task_id: str | None):
+    """The upstream ToolNode an analyst task's tool calls go through."""
+    nodes = u.TradingAgentsGraph._create_tool_nodes(None)
+    if task_id is None:
+        from langgraph.prebuilt import ToolNode
+
+        return ToolNode(list(all_tools(u).values()))
+    task = st["pending"].get(task_id)
+    analyst = st["run"]["analyst_nodes"].get(task["node"]) if task else None
+    if analyst is None:
+        raise UsageError(f"{task_id!r} is not a pending analyst task")
+    return nodes[analyst]
+
+
+def run_tool_call(tool_node, name: str, args: dict):
+    """Execute one tool call exactly as the analyst's ToolNode does inside the graph.
+
+    ToolNode needs the LangGraph runtime, so it runs as the only node of a
+    graph. Invalid calls come back as error ToolMessages for the model; any
+    other exception propagates, which in upstream aborts the run.
+    """
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, MessagesState, StateGraph
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("tools", tool_node)
+    graph.add_edge(START, "tools")
+    graph.add_edge("tools", END)
+    call = {"name": name, "args": args, "id": f"call_{uuid.uuid4().hex[:12]}", "type": "tool_call"}
+    ai_message = AIMessage(content="", tool_calls=[call])
+    return graph.compile().invoke({"messages": [ai_message]})["messages"][-1]
+
+
 def cmd_tool(args) -> int:
     run_dir = args.run_dir.expanduser().resolve()
     st = load_state(run_dir)
     u = load_upstream()
     u.set_config(build_config(u, st["config_overrides"]))
-    tools = all_tools(u)
-    if args.name not in tools:
-        raise UsageError(f"Unknown tool {args.name!r}; available: {', '.join(sorted(tools))}")
+    tool_node = tool_node_for(u, st, args.task)
     params = parse_params(args.params)
+    generation = st["pending"][args.task]["generation"] if args.task else None
     log = run_dir / "logs" / "tool_calls.jsonl"
     log.parent.mkdir(parents=True, exist_ok=True)
     started = datetime.now(timezone.utc)
+    cli_mirror.log_tool_call(run_dir, args.name, params)
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            output = tools[args.name].invoke(params)
-        ok = True
-    except Exception as exc:  # noqa: BLE001 - the agent should see any tool failure
-        output, ok = f"TOOL_ERROR: {type(exc).__name__}: {exc}", False
+            message = run_tool_call(tool_node, args.name, params)
+    except Exception as exc:  # noqa: BLE001 - upstream lets these abort the run
+        failure = {"at": started.isoformat(), "task": args.task, "generation": generation,
+                   "tool": args.name, "args": params, "error_type": type(exc).__name__, "error": str(exc)[:2000]}
+        with (run_dir / "logs" / "tool_failures.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(failure, ensure_ascii=False) + "\n")
+        print(f"RUN_FAILED: {type(exc).__name__}: {exc}")
+        return 1
+    cli_mirror.log_langchain_message(run_dir, message)
     with log.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"at": started.isoformat(), "tool": args.name, "args": params,
-                                 "ok": ok, "chars": len(str(output))}, ensure_ascii=False) + "\n")
-    print(output)
-    return 0 if ok else 1
+        handle.write(json.dumps({"at": started.isoformat(), "task": args.task, "tool": args.name,
+                                 "args": params, "status": message.status,
+                                 "chars": len(str(message.content))}, ensure_ascii=False) + "\n")
+    print(message.content)
+    return 0
 
 
 def cmd_doctor() -> dict:
@@ -786,7 +1005,7 @@ def main(argv=None) -> int:
             if args.command == "init":
                 result = cmd_init(args)
             elif args.command == "step":
-                result = step(args.run_dir.expanduser().resolve(), args.allow_freetext)
+                result = step(args.run_dir.expanduser().resolve(), args.allow_freetext, args.retry)
             else:
                 result = cmd_status(args)
     except UsageError as exc:
