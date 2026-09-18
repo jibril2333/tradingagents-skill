@@ -5,13 +5,19 @@ permissions:
 jobs:
   offline:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ['3.10', '3.12']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s tests -v
+      - name: Install pinned upstream
+        run: python -m pip install --disable-pip-version-check -r skills/tradingagents/scripts/requirements.txt
+      - name: Doctor
+        run: python skills/tradingagents/scripts/ta.py doctor
+      - name: Offline tests
+        run: python -m unittest discover -s tests -v

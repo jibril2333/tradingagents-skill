@@ -1,0 +1,12 @@
+{
+  "name": "tradingagents",
+  "version": "0.2.0",
+  "description": "Run the TradingAgents multi-agent research workflow with Claude Code subagents instead of LLM API calls.",
+  "author": {
+    "name": "jibril2333"
+  },
+  "homepage": "https://github.com/jibril2333/tradingagents-skill",
+  "repository": "https://github.com/jibril2333/tradingagents-skill",
+  "license": "Apache-2.0",
+  "keywords": ["trading", "research", "multi-agent", "tradingagents"]
+}
