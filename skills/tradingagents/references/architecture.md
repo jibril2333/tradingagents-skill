@@ -110,7 +110,7 @@ RUN_DIR/                         默认 结果目录/TICKER/日期
   reports/final_trade_decision.md
   message_tool.log               CLI 消息与工具调用日志
   result.json                    评级、状态、各输出路径、上游版本
-  state.json                     流程状态、配置覆盖、上游 AgentState（不含 messages）
+  state.json                     流程状态、运行配置（init 时固定，与上游单进程使用同一份配置一致）、上游 AgentState（不含 messages）
   tasks/NN-agent.prompt.md       发给子代理的任务
   tasks/NN-agent.response.md     子代理答案（被拒的改名为 .rejected-N.md，工具失败的为 .failed-N.md）
   cache/sentiment/               情绪分析师预取数据

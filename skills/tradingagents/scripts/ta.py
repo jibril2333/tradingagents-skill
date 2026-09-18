@@ -129,6 +129,11 @@ def build_config(u, overrides: dict) -> dict:
     return config
 
 
+def run_config(u, st: dict) -> dict:
+    """The config fixed when the run was created (older runs stored only overrides)."""
+    return deepcopy(st["config"]) if "config" in st else build_config(u, st["config_overrides"])
+
+
 def graph_shell(u, config: dict):
     """A TradingAgentsGraph without LLM clients.
 
@@ -629,7 +634,7 @@ def done_payload(run_dir: Path, result: dict) -> dict:
 def step(run_dir: Path, allow_freetext: bool = False, retry: bool = False) -> dict:
     u = load_upstream()
     st = load_state(run_dir)
-    graph = graph_shell(u, build_config(u, st["config_overrides"]))
+    graph = graph_shell(u, run_config(u, st))
     install_fetch_cache(run_dir)
 
     if st["phase"] == "done":
@@ -856,6 +861,9 @@ def cmd_init(args) -> dict:
     elif args.memory_log:
         overrides["memory_log_path"] = str(args.memory_log.expanduser().resolve())
 
+    # Upstream holds one config object for the whole run; resolve it once here
+    # so later processes are unaffected by a different environment or .env.
+    config = build_config(u, overrides)
     run_dir.mkdir(parents=True)
     st = {
         "version": 1,
@@ -869,7 +877,7 @@ def cmd_init(args) -> dict:
             "save_dir": save_dir,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
-        "config_overrides": overrides,
+        "config": config,
         "phase": "start", "seq": 0, "pending": {}, "completed": [], "graph": {}, "cursor": None,
         "timings": {},
     }
@@ -891,18 +899,32 @@ def cmd_status(args) -> dict:
             "tasks": [describe_task(st, t) for t in sorted(st["pending"])]}
 
 
-def parse_params(params: list[str]) -> dict:
+def _arg_types(spec: dict) -> set[str]:
+    types = {spec["type"]} if "type" in spec else {option.get("type") for option in spec.get("anyOf", [])}
+    return {kind for kind in types if kind}
+
+
+def parse_params(params: list[str], arg_specs: dict | None = None) -> dict:
+    """Turn ``name=value`` words into tool-call arguments.
+
+    A model sends typed JSON arguments; here values arrive as text, so each one
+    follows the tool's declared type: string parameters keep the text as is
+    (``symbol=7203`` stays ``"7203"``), other values are read as JSON scalars.
+    """
     values = {}
     for item in params:
         name, sep, raw = item.partition("=")
         if not sep or not name:
             raise UsageError(f"Tool arguments use name=value, got {item!r}")
+        types = _arg_types((arg_specs or {}).get(name, {}))
+        if "string" in types and not types & {"integer", "number", "boolean"}:
+            values[name] = None if raw == "null" and "null" in types else raw
+            continue
         try:
-            values[name] = json.loads(raw)
+            value = json.loads(raw)
         except ValueError:
-            values[name] = raw
-        if not isinstance(values[name], (int, float, bool, type(None))):
-            values[name] = raw
+            value = raw
+        values[name] = value if isinstance(value, (int, float, bool, type(None))) else raw
     return values
 
 
@@ -943,9 +965,10 @@ def cmd_tool(args) -> int:
     run_dir = args.run_dir.expanduser().resolve()
     st = load_state(run_dir)
     u = load_upstream()
-    u.set_config(build_config(u, st["config_overrides"]))
+    u.set_config(run_config(u, st))
     tool_node = tool_node_for(u, st, args.task)
-    params = parse_params(args.params)
+    tool = tool_node.tools_by_name.get(args.name)
+    params = parse_params(args.params, tool.args if tool is not None else None)
     generation = st["pending"][args.task]["generation"] if args.task else None
     log = run_dir / "logs" / "tool_calls.jsonl"
     log.parent.mkdir(parents=True, exist_ok=True)

@@ -73,6 +73,14 @@ class ParamsTest(unittest.TestCase):
             {"symbol": "NVDA", "look_back_days": 30, "curr_date": "2026-09-15", "flag": True, "x": "[1]"},
         )
 
+    def test_values_follow_declared_argument_types(self):
+        specs = {"symbol": {"type": "string"}, "look_back_days": {"type": "integer"},
+                 "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]}, "topic": {"type": "string"}}
+        self.assertEqual(
+            ta.parse_params(["symbol=7203", "look_back_days=30", "limit=null", "topic=true"], specs),
+            {"symbol": "7203", "look_back_days": 30, "limit": None, "topic": "true"},
+        )
+
     def test_rejects_positional_values(self):
         with self.assertRaises(ta.UsageError):
             ta.parse_params(["NVDA"])
@@ -295,6 +303,13 @@ class DriverTest(unittest.TestCase):
                                  "symbol=NVDA", "start_date=2026-09-01", "end_date=2026-09-15")
         self.assertEqual((code, text.strip()), (0, "Date,Close\n2026-09-15,211.56"))
 
+        # Numeric-looking symbols stay strings, as a model's JSON arguments would.
+        with mock.patch("tradingagents.agents.utils.core_stock_tools.route_to_vendor",
+                        side_effect=lambda method, symbol, *rest: f"{method}:{symbol!r}"):
+            code, text = run_cli("tool", "--run-dir", run_dir, "--task", task, "get_stock_data",
+                                 "symbol=7203", "start_date=2026-09-01", "end_date=2026-09-15")
+        self.assertEqual((code, text.strip()), (0, "get_stock_data:'7203'"))
+
         # A tool outside this analyst's ToolNode and a bad argument come back as
         # error messages for the model, exactly as ToolNode returns them.
         code, text = run_cli("tool", "--run-dir", run_dir, "--task", task, "get_news", "ticker=NVDA")
@@ -341,8 +356,7 @@ class DriverTest(unittest.TestCase):
         st = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual((st["run"]["debate_rounds"], st["run"]["risk_rounds"], st["run"]["language"]),
                          (2, 1, "Chinese"))
-        u = ta.load_upstream()
-        merged = ta.build_config(u, st["config_overrides"])
+        merged = st["config"]
         self.assertEqual(merged["news_article_limit"], 5)
         self.assertEqual(merged["tool_vendors"], {"get_news": "alpha_vantage"})
         self.assertEqual(merged["data_vendors"]["core_stock_apis"], "alpha_vantage")
@@ -395,7 +409,7 @@ class DriverTest(unittest.TestCase):
         run_dir, out = self.init("--analysts", "market", "--research-depth", "3", "--no-memory")
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual((state["run"]["debate_rounds"], state["run"]["risk_rounds"]), (3, 3))
-        self.assertEqual(state["config_overrides"]["max_debate_rounds"], 3)
+        self.assertEqual(state["config"]["max_debate_rounds"], 3)
         # An explicit flag still wins over the depth setting.
         code, out = run_cli("init", "--ticker", "NVDA", "--date", "2026-09-15", "--no-memory",
                             "--research-depth", "3", "--risk-rounds", "1",
@@ -412,10 +426,28 @@ class DriverTest(unittest.TestCase):
         self.assertEqual(state["run"]["risk_rounds"], DEFAULT_CONFIG["max_risk_discuss_rounds"])
         self.assertEqual(state["run"]["language"], DEFAULT_CONFIG["output_language"])
         self.assertEqual(state["run"]["asset_type"], "stock")
-        # Only knobs this skill must control are overridden.
-        self.assertEqual(set(state["config_overrides"]) - {"memory_log_path"},
-                         {"output_language", "max_debate_rounds", "max_risk_discuss_rounds",
-                          "checkpoint_enabled", "llm_provider", "deep_think_llm", "quick_think_llm"})
+        # The run's config is DEFAULT_CONFIG except the knobs this skill controls.
+        changed = {key for key, value in state["config"].items() if DEFAULT_CONFIG.get(key) != value}
+        self.assertEqual(changed, {"memory_log_path", "llm_provider", "deep_think_llm", "quick_think_llm"})
+
+    def test_config_is_fixed_for_the_whole_run(self):
+        # Upstream keeps one config object for a run; a later process with a
+        # different environment must not move the run's outputs.
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        run_dir, out = self.init("--analysts", "market", "--no-memory", "--no-save")
+        with mock.patch.dict(DEFAULT_CONFIG, {"results_dir": str(self.root / "elsewhere"),
+                                              "output_language": "Japanese"}):
+            while out["status"] != "done":
+                for task in out["tasks"]:
+                    answer(task)
+                code, out = run_cli("step", "--run-dir", run_dir)
+        result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertTrue(result["state_log"].startswith(str(RESULTS_DIR)))
+        self.assertTrue(Path(result["state_log"]).is_file())
+        self.assertFalse((self.root / "elsewhere").exists())
+        prompts = "".join(p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*.prompt.md"))
+        self.assertNotIn("Japanese", prompts)
 
     def test_rejects_bad_inputs(self):
         code, out = run_cli("init", "--ticker", "../etc", "--run-dir", self.root / "x")
