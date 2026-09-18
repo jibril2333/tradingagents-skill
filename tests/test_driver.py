@@ -116,8 +116,9 @@ class BridgeTest(unittest.TestCase):
                                                        render_research_plan, "RM"), "plain prose")
 
 
-@unittest.skipUnless(HAVE_UPSTREAM, "pinned upstream is not installed")
-class DriverTest(unittest.TestCase):
+class OfflineCase(unittest.TestCase):
+    """Real upstream code; network, identity lookup and social fetchers stubbed."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -147,6 +148,9 @@ class DriverTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         return run_dir, out
 
+
+@unittest.skipUnless(HAVE_UPSTREAM, "pinned upstream is not installed")
+class DriverTest(OfflineCase):
     def test_full_run_follows_upstream_graph(self):
         run_dir, out = self.init()
         self.assertEqual(out["status"], "tasks")
@@ -363,6 +367,20 @@ class DriverTest(unittest.TestCase):
         self.assertEqual(merged["data_vendors"]["macro_data"], "fred")
         self.assertEqual(merged["data_vendors"]["prediction_markets"], "polymarket")
 
+    def test_report_save_error_is_reported_like_the_cli(self):
+        blocker = self.root / "blocked"
+        blocker.write_text("not a directory", encoding="utf-8")
+        run_dir, out = self.init("--analysts", "market", "--no-memory", "--save-dir", blocker)
+        self.assertTrue((run_dir / "reports").is_dir())
+        while out["status"] != "done":
+            for task in out["tasks"]:
+                answer(task)
+            code, out = run_cli("step", "--run-dir", run_dir)
+        result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertIsNone(result["report"])
+        self.assertTrue(result["report_error"].startswith("Error saving report:"))
+        self.assertEqual(result["status"], "completed")
+
     def test_cli_input_rules(self):
         code, out = run_cli("init", "--date", "2026-09-15", "--no-memory", "--no-save",
                             "--analysts", "news", "market", "--run-dir", self.root / "spy")
@@ -454,6 +472,171 @@ class DriverTest(unittest.TestCase):
         self.assertEqual((code, out["status"]), (2, "error"))
         code, out = run_cli("init", "--ticker", "NVDA", "--date", "2999-01-01", "--run-dir", self.root / "y")
         self.assertEqual((code, out["status"]), (2, "error"))
+
+
+NODE_MARKERS = (
+    ("reviewing your own past decision", "Reflection"),
+    ("As the Portfolio Manager", "Portfolio Manager"),
+    ("As the Research Manager", "Research Manager"),
+    ("As the Aggressive Risk Analyst", "Aggressive Analyst"),
+    ("As the Conservative Risk Analyst", "Conservative Analyst"),
+    ("As the Neutral Risk Analyst", "Neutral Analyst"),
+    ("You are a Bull Analyst", "Bull Researcher"),
+    ("You are a Bear Analyst", "Bear Researcher"),
+    ("You are a trading agent analyzing market data", "Trader"),
+    ("You are a trading assistant tasked with analyzing financial markets", "Market Analyst"),
+    ("financial market sentiment analyst", "Sentiment Analyst"),
+    ("You are a news researcher", "News Analyst"),
+    ("analyzing fundamental information", "Fundamentals Analyst"),
+)
+
+
+def identify(messages):
+    text = "\n".join(content for _, content in messages)
+    return next(node for marker, node in NODE_MARKERS if marker in text)
+
+
+def canned(node, turn):
+    node = "Reflection" if node.startswith("Reflection") else node
+    structured = STRUCTURED_ANSWERS.get(node)
+    return json.dumps(structured) if structured else f"{node} answer {turn} for NVDA."
+
+
+class ScriptedChatModel:
+    """Deterministic stand-in for a provider model inside the real upstream graph."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _answer(self, value):
+        from skill_llm import to_messages
+
+        messages = to_messages(value)
+        node = identify(messages)
+        self.calls.append((node, messages))
+        return canned(node, sum(1 for name, _ in self.calls if name == node))
+
+    def invoke(self, value, *args, **kwargs):
+        from langchain_core.messages import AIMessage
+
+        return AIMessage(content=self._answer(value))
+
+    def bind_tools(self, tools, **kwargs):
+        from langchain_core.messages import AIMessage
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(lambda value: AIMessage(content=self._answer(value)))
+
+    def with_structured_output(self, schema, **kwargs):
+        return SimpleNamespace(invoke=lambda value, *a, **k: schema.model_validate_json(self._answer(value)))
+
+
+@unittest.skipUnless(HAVE_UPSTREAM, "pinned upstream is not installed")
+class UpstreamEquivalenceTest(OfflineCase):
+    """Same model answers in, same prompts, state, logs and reports out."""
+
+    def run_upstream(self, ticker, analysts, rounds, asset_type):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        model = ScriptedChatModel()
+        config = {**DEFAULT_CONFIG, "results_dir": str(self.root / "up_results"),
+                  "memory_log_path": str(self.root / "up_memory.md"), "output_language": "Chinese",
+                  "max_debate_rounds": rounds, "max_risk_discuss_rounds": rounds}
+        client = SimpleNamespace(get_llm=lambda: model)
+        with mock.patch("tradingagents.graph.trading_graph.create_llm_client", return_value=client):
+            graph = TradingAgentsGraph(selected_analysts=analysts, config=config)
+            state, signal = graph.propagate(ticker, "2026-09-15", asset_type=asset_type)
+            graph.save_reports(state, ticker, save_path=self.root / "up_reports")
+        return model.calls, state, signal
+
+    def run_skill(self, ticker_input, analysts, rounds):
+        calls, turns = [], {}
+        render = ta.render_task
+
+        def recording_render(run_dir, node, request, output_file, task_id):
+            calls.append((node, request.messages))
+            return render(run_dir, node, request, output_file, task_id)
+
+        config = self.root / "skill_config.json"
+        config.write_text(json.dumps({"results_dir": str(self.root / "skill_results")}), encoding="utf-8")
+        with mock.patch.object(ta, "render_task", recording_render):
+            code, out = run_cli("init", "--ticker", ticker_input, "--date", "2026-09-15", "--language", "Chinese",
+                                "--analysts", *analysts, "--research-depth", str(rounds), "--config", config,
+                                "--memory-log", self.root / "skill_memory.md",
+                                "--save-dir", self.root / "skill_saved")
+            run_dir = Path(out["run_dir"])
+            while out["status"] != "done":
+                for task in out["tasks"]:
+                    turns[task["agent"]] = turns.get(task["agent"], 0) + 1
+                    answer(task, canned(task["agent"], turns[task["agent"]]))
+                code, out = run_cli("step", "--run-dir", run_dir)
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))["graph"]
+        return calls, state, out, run_dir
+
+    def assert_equivalent(self, analysts, rounds, ticker_input="NVDA", ticker="NVDA", asset_type="stock",
+                          upstream_analysts=None):
+        # The CLI hands TradingAgentsGraph its selection in ANALYST_ORDER.
+        order = ["market", "social", "news", "fundamentals"]
+        up_calls, up_state, up_signal = self.run_upstream(
+            ticker, upstream_analysts or sorted(analysts, key=order.index), rounds, asset_type)
+        skill_calls, skill_state, out, run_dir = self.run_skill(ticker_input, analysts, rounds)
+
+        # Every model call: same node, same messages, same order.
+        def names(calls):
+            return ["Reflection" if node.startswith("Reflection") else node for node, _ in calls]
+
+        self.assertEqual(names(skill_calls), names(up_calls))
+        for (node, skill_messages), (_, up_messages) in zip(skill_calls, up_calls):
+            self.assertEqual(skill_messages, up_messages, node)
+
+        # Final state, signal, state log, decision log.
+        self.assertEqual(skill_state, {k: v for k, v in up_state.items() if k not in ("messages", "sender")})
+        self.assertEqual(out["signal"], up_signal)
+        log_name = Path(ticker) / "TradingAgentsStrategy_logs" / "full_states_log_2026-09-15.json"
+        self.assertEqual(json.loads((self.root / "skill_results" / log_name).read_text(encoding="utf-8")),
+                         json.loads((self.root / "up_results" / log_name).read_text(encoding="utf-8")))
+        self.assertEqual((self.root / "skill_memory.md").read_text(encoding="utf-8"),
+                         (self.root / "up_memory.md").read_text(encoding="utf-8"))
+        return skill_calls
+
+        # Report tree, apart from the generation timestamp line.
+        def tree(root):
+            files = {}
+            for path in sorted(root.rglob("*.md")):
+                text = path.read_text(encoding="utf-8")
+                files[str(path.relative_to(root))] = "\n".join(
+                    line for line in text.splitlines() if not line.startswith("Generated: "))
+            return files
+
+        self.assertEqual(tree(Path(out["report"]).parent), tree(self.root / "up_reports"))
+
+    def test_default_run_matches_upstream_propagate(self):
+        self.assert_equivalent(["market", "social", "news", "fundamentals"], 1)
+
+    def test_deep_run_matches_upstream_propagate(self):
+        self.assert_equivalent(["news", "social"], 3)
+
+    def test_crypto_run_matches_upstream_propagate(self):
+        # CLI input "btcusd" -> BTC-USD, crypto, fundamentals analyst dropped.
+        self.assert_equivalent(["market", "social", "news", "fundamentals"], 1, ticker_input="btcusd",
+                               ticker="BTC-USD", asset_type="crypto",
+                               upstream_analysts=["market", "social", "news"])
+
+    def test_memory_reflection_matches_upstream_propagate(self):
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        log = ("[2026-09-01 | NVDA | Buy | pending]\n\nDECISION:\n**Rating**: Buy\n\n<!-- ENTRY_END -->\n\n"
+               "[2026-08-20 | AAPL | Hold | +1.0% | -0.5% | 5d | resolved:2026-08-27]\n\nDECISION:\n"
+               "**Rating**: Hold\n\nREFLECTION:\nWaiting was right.\n\n<!-- ENTRY_END -->\n\n")
+        for name in ("up_memory.md", "skill_memory.md"):
+            (self.root / name).write_text(log, encoding="utf-8")
+        with mock.patch.object(TradingAgentsGraph, "_fetch_returns", return_value=(0.05, 0.02, 5, "2026-09-08")):
+            calls = self.assert_equivalent(["market"], 1)
+        self.assertEqual(calls[0][0], "Reflection 2026-09-01")
+        pm_prompt = calls[-1][1][0][1]
+        self.assertIn("Lessons from prior decisions and outcomes", pm_prompt)
+        self.assertIn("Waiting was right.", pm_prompt)
 
 
 if __name__ == "__main__":

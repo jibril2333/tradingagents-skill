@@ -498,10 +498,13 @@ def finalize(u, graph, run_dir: Path, st: dict) -> dict:
     cli_mirror.log_message(run_dir, "System", f"Completed analysis for {trade_date}")
     wall_times = analyst_wall_time_summary(u, run, st["timings"])
     cli_mirror.log_message(run_dir, "System", wall_times)
-    report = None
+    report = report_error = None
     if run["save_dir"]:
         save_path = Path(run["save_dir"]) / f"{ticker}_{datetime.now():%Y%m%d_%H%M%S}"
-        report = str(u.write_report_tree(state, ticker, save_path))
+        try:
+            report = str(u.write_report_tree(state, ticker, save_path))
+        except Exception as exc:  # noqa: BLE001 - the CLI reports a save error and carries on
+            report_error = f"Error saving report: {exc}"
 
     result = {
         "status": "completed" if signal in RATINGS else "needs_review",
@@ -509,7 +512,8 @@ def finalize(u, graph, run_dir: Path, st: dict) -> dict:
         "analysts": run["analysts"], "language": run["language"],
         "debate_rounds": run["debate_rounds"], "risk_rounds": run["risk_rounds"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "report": report, "reports_dir": str(run_dir / "reports"),
+        "report": report, **({"report_error": report_error} if report_error else {}),
+        "reports_dir": str(run_dir / "reports"),
         "final_decision": str(run_dir / "reports" / "final_trade_decision.md"),
         "message_log": str(run_dir / "message_tool.log"),
         "state_log": str(Path(graph.config["results_dir"]) / u.safe_ticker_component(ticker)
@@ -882,7 +886,9 @@ def cmd_init(args) -> dict:
         "timings": {},
     }
     save_state(run_dir, st)
-    # The CLI's opening System messages.
+    # The CLI creates reports/ and message_tool.log before streaming, then logs
+    # its opening System messages.
+    (run_dir / "reports").mkdir()
     cli_mirror.log_message(run_dir, "System", f"Selected ticker: {ticker}")
     if asset_type != "stock":
         cli_mirror.log_message(run_dir, "System", f"Detected asset type: {asset_type}")
