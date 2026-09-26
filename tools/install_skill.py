@@ -6,12 +6,21 @@ from pathlib import Path
 import shutil
 import stat
 
+# User-scope skill directories: Claude Code, and Codex per its skills documentation.
+DEFAULT_DESTS = {
+    "claude-code": Path.home() / ".claude" / "skills",
+    "codex": Path.home() / ".agents" / "skills",
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dest", type=Path, default=Path.home() / ".claude" / "skills",
-                        help="Skill parent directory (default: ~/.claude/skills)")
+    parser.add_argument("--host", choices=sorted(DEFAULT_DESTS), default="claude-code",
+                        help="Install into this host's user skill directory")
+    parser.add_argument("--dest", type=Path,
+                        help="Skill parent directory (default: ~/.claude/skills, or ~/.agents/skills for Codex)")
     args = parser.parse_args()
+    args.dest = args.dest or DEFAULT_DESTS[args.host]
     source = Path(__file__).resolve().parents[1] / "skills" / "tradingagents"
     target = args.dest.expanduser().resolve() / "tradingagents"
     if target.exists():

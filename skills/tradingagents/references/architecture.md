@@ -63,6 +63,7 @@ LangGraph 编排被 `ta.py` 的步进循环替代，以便在每次模型调用�
 | 报告树 | `./reports/TICKER_YYYYmmdd_HHMMSS` | CLI「Save report」默认 |
 | 状态日志 | `结果目录/TICKER/TradingAgentsStrategy_logs/` | 上游 `_log_state` |
 | checkpoint | 关闭 | `DEFAULT_CONFIG` |
+| 子代理模型（quick / deep） | Claude Code：`sonnet` / `opus`；Codex：`gpt-6-luna` / `gpt-6-sol` | 由 `--host` 决定，对应上游 `quick_think_llm` / `deep_think_llm` 的分工 |
 
 `tradingagents` 包在导入时从当前目录加载 `.env`，本 skill 照常受其影响。`--config 配置.json` 中的键以与上游 `set_config` 相同的方式合并（字典值合并一层），用于数据源链、`tool_vendors`、新闻条数与回看窗口、基准指数、结果目录、缓存目录、记忆条数上限等。命令行参数优先于配置文件。
 

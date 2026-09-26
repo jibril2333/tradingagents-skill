@@ -5,14 +5,15 @@ description: Run the TauricResearch TradingAgents multi-agent research workflow 
 
 # TradingAgents
 
-上游 TradingAgents 的智能体代码、提示词、数据工具、辩论路由、评级解析、报告与记忆日志在本地 Python 中原样运行。上游原本调用 LLM API 的每一步被转换成任务文件，由子代理作答。你是编排者：运行驱动脚本、派发子代理、交付结果。不需要任何 LLM API key。
+上游 TradingAgents 的智能体代码、提示词、数据工具、辩论路由、评级解析、报告与记忆日志在本地 Python 中原样运行。上游原本调用 LLM API 的每一步被转换成任务文件，由子代理作答。你是编排者：运行驱动脚本、派发子代理、交付结果。不需要任何 LLM API key。适用于 Claude Code 与 Codex，两者只在派发子代理的方式上不同。
 
 下文 `TA` 指 `SKILL_DIR/scripts/ta`（Windows 为 `SKILL_DIR\scripts\ta.cmd`），`SKILL_DIR` 是本文件所在目录的绝对路径。
 
 ## 准备
 
 1. 执行 `TA doctor`，`ready` 为 `true` 即可继续。
-2. 输出 `setup_required` 或 `ready: false` 时，执行 `python3 SKILL_DIR/scripts/setup_runtime.py`（任意 Python 3 均可启动，脚本会自行寻找 3.10+ 解释器或用 uv 下载；默认安装到 `~/.tradingagents-skill/venv`，需要网络，只需一次），然后重新 doctor。脚本报告找不到解释器时，把它列出的安装选项转告用户。细节见 [环境与故障](references/setup.md)。
+2. 在 Codex 中，本 skill 的命令需要联网并写入 `~/.tradingagents` 与 `~/.tradingagents-skill`。Codex 默认沙箱不联网，这些命令会逐次请求批准；分析师子代理取数时同样如此。批准次数过多时，把 [环境与故障](references/setup.md) 中的 Codex 沙箱配置转告用户，不要自行修改用户配置。
+3. 输出 `setup_required` 或 `ready: false` 时，执行 `python3 SKILL_DIR/scripts/setup_runtime.py`（任意 Python 3 均可启动，脚本会自行寻找 3.10+ 解释器或用 uv 下载；默认安装到 `~/.tradingagents-skill/venv`，需要网络，只需一次），然后重新 doctor。脚本报告找不到解释器时，把它列出的安装选项转告用户。细节见 [环境与故障](references/setup.md)。
 
 ## 明确输入
 
@@ -21,14 +22,15 @@ description: Run the TauricResearch TradingAgents multi-agent research workflow 
 - 资产类型按 ticker 自动判定，与上游 CLI 一致；加密货币自动去掉基本面分析师。需要覆盖时用 `--asset-type`。
 - 报告语言跟随用户：中文对话传 `--language Chinese`。
 - 未给 ticker 时与 CLI 一样使用 `SPY`。上游其他配置项（数据源链、单个工具的数据源、新闻条数、基准指数、结果目录等）可用 `--config 配置.json` 传入，合并方式与 Python 用法相同。
-- 其余保持默认，除非用户提出：分析师全选、辩论与风险讨论各 1 轮（上游默认值；`--research-depth` 同时设置两者，上游 CLI 的档位是 1、3、5）、`--quick-model sonnet`、`--deep-model opus`（Research Manager 与 Portfolio Manager 使用 deep）、记忆日志开启（`--no-memory` 关闭）。
+- 其余保持默认，除非用户提出：分析师全选、辩论与风险讨论各 1 轮（上游默认值；`--research-depth` 同时设置两者，上游 CLI 的档位是 1、3、5）、模型档位（Research Manager 与 Portfolio Manager 使用 deep，其余 quick；默认值随 `--host`，见下）、记忆日志开启（`--no-memory` 关闭）。
 
 ## 运行循环
 
-1. `TA init --ticker NVDA --date YYYY-MM-DD --language Chinese`，得到 JSON，记下 `run_dir`（默认与上游 CLI 相同：结果目录下的 `TICKER/日期`）。
-2. 当 `status` 为 `tasks` 或 `waiting`，为 `tasks` 中每一项派发一个子代理：
-   - Agent 工具，`subagent_type: general-purpose`，`model` 用该项的 `model`，`description` 用该项的 `agent`，`prompt` 原样使用 `subagent_prompt`。
-   - `parallel` 为 `true` 时，在同一条消息中派发全部任务。
+1. `TA init --ticker NVDA --date YYYY-MM-DD --language Chinese --host HOST`，得到 JSON，记下 `run_dir`（默认与上游 CLI 相同：结果目录下的 `TICKER/日期`）。`HOST` 为 `claude-code`（默认）或 `codex`，决定任务里的 `model` 默认值：Claude Code 为 `sonnet` / `opus`，Codex 为 `gpt-6-luna` / `gpt-6-sol`。
+2. 当 `status` 为 `tasks` 或 `waiting`，为 `tasks` 中每一项派发一个子代理，提示词原样使用该项的 `subagent_prompt`，模型使用该项的 `model`：
+   - Claude Code：Agent 工具，`subagent_type: general-purpose`，`description` 用该项的 `agent`。
+   - Codex：为每一项启动一个子代理（一个任务对应一个子代理，不要合并），并指定该项的模型。
+   - `parallel` 为 `true` 时，同时派发全部任务。
    - 不要自己读取 `prompt_file` 或答案文件，它们很长；子代理回复 `done` 即表示已写入。
 3. 本轮子代理全部结束后执行 `TA step --run-dir RUN_DIR`，回到第 2 步。
    - `waiting` 且任务带 `error`：按返回的新 `subagent_prompt` 重新派发该项。结构化答案第一次未通过上游 schema 校验时要求改正；再次失败时任务文件自动改为纯文本作答，与上游 `invoke_structured_or_freetext` 的自由文本回退一致。
@@ -38,9 +40,9 @@ description: Run the TauricResearch TradingAgents multi-agent research workflow 
 
 默认一次运行 12 个任务：4 个分析师并行，之后按上游顺序串行（Bull、Bear、Research Manager、Trader、Aggressive、Conservative、Neutral、Portfolio Manager）。记忆日志里有待复盘的同一 ticker 历史决策时，会先出现复盘任务。run 目录保存全部状态，中断后用 `TA status --run-dir RUN_DIR` 查看、`TA step --run-dir RUN_DIR` 继续。
 
-当前环境没有子代理工具时，自己逐项完成：读取 `prompt_file`，按其中规则把答案写入 `output_file`，再执行 `step`。
+每个任务必须由独立的子代理完成：各角色只应看到自己任务文件里的材料，这是上游多智能体设计的前提。当前环境无法启动子代理时，告知用户并停止，不要在同一会话里依次扮演各角色。
 
-分析师子代理通过 Bash 调用任务文件里打印的 `ta.py tool` 命令取数。权限确认过多时，可建议用户在 Claude Code 权限设置中允许该命令前缀。
+分析师子代理通过 shell 调用任务文件里打印的 `ta.py tool` 命令取数。Claude Code 中权限确认过多时，可建议用户允许该命令前缀；Codex 见上文第 2 步。
 
 ## 解读并交付
 

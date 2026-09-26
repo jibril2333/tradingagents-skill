@@ -38,7 +38,14 @@ SCRIPT = Path(__file__).resolve()
 STATE_FILE = "state.json"
 ANALYSTS = ("market", "social", "news", "fundamentals")
 RATINGS = ("Buy", "Overweight", "Hold", "Underweight", "Sell")
-DEFAULT_MODELS = {"quick": "sonnet", "deep": "opus"}
+# Subagent models per host, standing in for upstream's quick/deep LLM pair.
+# Codex: its subagent docs list gpt-6-sol for demanding multi-step work and
+# gpt-6-luna for fast, narrowly scoped tasks.
+HOSTS = ("claude-code", "codex")
+DEFAULT_MODELS = {
+    "claude-code": {"quick": "sonnet", "deep": "opus"},
+    "codex": {"quick": "gpt-6-luna", "deep": "gpt-6-sol"},
+}
 
 # Same model tier per node as upstream GraphSetup.setup_graph.
 NODE_TIERS = {
@@ -763,10 +770,14 @@ def build_parser() -> argparse.ArgumentParser:
                            "benchmark, results_dir, ...), merged over DEFAULT_CONFIG like the Python API")
     init.add_argument("--data-vendor", choices=("yfinance", "alpha_vantage"),
                       help="Shortcut: use one vendor for prices, indicators, fundamentals and news")
-    init.add_argument("--quick-model", default=DEFAULT_MODELS["quick"],
-                      help="Subagent model for upstream quick-think nodes")
-    init.add_argument("--deep-model", default=DEFAULT_MODELS["deep"],
-                      help="Subagent model for Research Manager and Portfolio Manager")
+    init.add_argument("--host", choices=HOSTS, default="claude-code",
+                      help="Agent host that dispatches the subagents; sets the default models")
+    init.add_argument("--quick-model",
+                      help="Subagent model for upstream quick-think nodes "
+                           "(default: sonnet on Claude Code, gpt-6-luna on Codex)")
+    init.add_argument("--deep-model",
+                      help="Subagent model for Research Manager and Portfolio Manager "
+                           "(default: opus on Claude Code, gpt-6-sol on Codex)")
     memory = init.add_mutually_exclusive_group()
     memory.add_argument("--memory-log", type=Path, help="Decision log path (default: upstream)")
     memory.add_argument("--no-memory", action="store_true", help="Do not read or write the decision log")
@@ -845,6 +856,8 @@ def cmd_init(args) -> dict:
                          f"`step --run-dir`, or start a separate run with `--run-dir`.")
 
     language = args.language or file_config.get("output_language") or u.DEFAULT_CONFIG["output_language"]
+    quick_model = args.quick_model or DEFAULT_MODELS[args.host]["quick"]
+    deep_model = args.deep_model or DEFAULT_MODELS[args.host]["deep"]
     save_dir = None if args.no_save else str((args.save_dir or Path.cwd() / "reports").expanduser().resolve())
     overrides = {
         **file_config,
@@ -853,8 +866,8 @@ def cmd_init(args) -> dict:
         "max_risk_discuss_rounds": risk_rounds,
         "checkpoint_enabled": False,
         "llm_provider": "skill-subagent",
-        "deep_think_llm": args.deep_model,
-        "quick_think_llm": args.quick_model,
+        "deep_think_llm": deep_model,
+        "quick_think_llm": quick_model,
     }
     if args.data_vendor:
         overrides["data_vendors"] = {**file_config.get("data_vendors", {}), **{
@@ -877,7 +890,8 @@ def cmd_init(args) -> dict:
             "analysts": analysts, "dropped_analysts": dropped, "language": language,
             "debate_rounds": debate_rounds, "risk_rounds": risk_rounds,
             "analyst_nodes": {spec.agent_node: spec.key for spec in plan.specs},
-            "models": {"quick": args.quick_model, "deep": args.deep_model},
+            "host": args.host,
+            "models": {"quick": quick_model, "deep": deep_model},
             "save_dir": save_dir,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },

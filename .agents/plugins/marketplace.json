@@ -1,0 +1,20 @@
+{
+  "name": "tradingagents-skill",
+  "interface": {
+    "displayName": "TradingAgents Skill"
+  },
+  "plugins": [
+    {
+      "name": "tradingagents",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

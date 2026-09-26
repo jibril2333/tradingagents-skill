@@ -381,6 +381,17 @@ class DriverTest(OfflineCase):
         self.assertTrue(result["report_error"].startswith("Error saving report:"))
         self.assertEqual(result["status"], "completed")
 
+    def test_host_sets_default_subagent_models(self):
+        run_dir, out = self.init("--analysts", "market", "--no-memory", "--host", "codex")
+        self.assertEqual(out["tasks"][0]["model"], "gpt-6-luna")
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))["run"]
+        self.assertEqual((state["host"], state["models"]), ("codex", {"quick": "gpt-6-luna", "deep": "gpt-6-sol"}))
+        code, out = run_cli("init", "--ticker", "NVDA", "--date", "2026-09-15", "--no-memory", "--no-save",
+                            "--analysts", "market", "--host", "codex", "--deep-model", "gpt-6-astra",
+                            "--run-dir", self.root / "astra")
+        state = json.loads((self.root / "astra" / "state.json").read_text(encoding="utf-8"))["run"]
+        self.assertEqual(state["models"], {"quick": "gpt-6-luna", "deep": "gpt-6-astra"})
+
     def test_cli_input_rules(self):
         code, out = run_cli("init", "--date", "2026-09-15", "--no-memory", "--no-save",
                             "--analysts", "news", "market", "--run-dir", self.root / "spy")

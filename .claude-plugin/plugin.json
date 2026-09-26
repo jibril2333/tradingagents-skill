@@ -1,6 +1,6 @@
 {
   "name": "tradingagents",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run the TradingAgents multi-agent research workflow with Claude Code subagents instead of LLM API calls.",
   "author": {
     "name": "jibril2333"
