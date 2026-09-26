@@ -2,7 +2,7 @@
 
 ## 运行环境
 
-需要 Python 3.10+（推荐 3.12）、Git 和网络。
+需要 Git 和网络。运行环境使用 Python 3.10+（推荐 3.12），但安装脚本本身可由任意 Python 3 启动：启动它的解释器低于 3.10 时，脚本依次尝试 PATH 与 Homebrew 目录中的 `python3.13`…`python3.10`、Windows 的 `py -3.x`，再尝试用 uv 下载 Python 3.12；都不可用时列出安装选项并退出。
 
 ```text
 python3 SKILL_DIR/scripts/setup_runtime.py
@@ -38,6 +38,8 @@ python3 SKILL_DIR/scripts/setup_runtime.py
 | 现象 | 处理 |
 | --- | --- |
 | `setup_required` | 运行 setup_runtime.py，或设置 `TRADINGAGENTS_SKILL_PYTHON` |
+| setup 报告找不到 Python 3.10+ | 安装 python.org 的 Python 3.12、`brew install python@3.12`，或安装 uv，然后重新运行 setup_runtime.py |
+| setup 报告已有环境低于 3.10 | 删除 `~/.tradingagents-skill/venv` 或换一个 `--env-dir` 后重新运行 |
 | doctor 显示 `verified_revision: false` | 用同一解释器重新执行 setup_runtime.py，不要改用 PyPI 上的同名包 |
 | 某任务反复 `waiting` 且无 `error` | 子代理没有写入 `output_file`；重新派发，确认子代理有写文件权限 |
 | 结构化任务被拒 | 第一次按 `error` 改正；第二次自动改为纯文本作答（上游回退）。`step --allow-freetext` 可直接接受当前答案 |

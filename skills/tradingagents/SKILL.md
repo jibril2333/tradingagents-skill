@@ -12,7 +12,7 @@ description: Run the TauricResearch TradingAgents multi-agent research workflow 
 ## 准备
 
 1. 执行 `TA doctor`，`ready` 为 `true` 即可继续。
-2. 输出 `setup_required` 或 `ready: false` 时，用 Python 3.10+ 执行 `python3 SKILL_DIR/scripts/setup_runtime.py`（默认安装到 `~/.tradingagents-skill/venv`，需要网络，只需一次），然后重新 doctor。细节见 [环境与故障](references/setup.md)。
+2. 输出 `setup_required` 或 `ready: false` 时，执行 `python3 SKILL_DIR/scripts/setup_runtime.py`（任意 Python 3 均可启动，脚本会自行寻找 3.10+ 解释器或用 uv 下载；默认安装到 `~/.tradingagents-skill/venv`，需要网络，只需一次），然后重新 doctor。脚本报告找不到解释器时，把它列出的安装选项转告用户。细节见 [环境与故障](references/setup.md)。
 
 ## 明确输入
 
