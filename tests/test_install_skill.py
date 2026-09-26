@@ -1,5 +1,6 @@
 """tools/install_skill.py copies the skill into the chosen host's skill directory."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class InstallSkillTest(unittest.TestCase):
     def run_installer(self, home, *args):
-        env = {"HOME": str(home), "USERPROFILE": str(home), "PATH": ""}
+        # Keep the rest of the environment: Windows needs SYSTEMROOT to start Python.
+        env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
         return subprocess.run([sys.executable, str(ROOT / "tools" / "install_skill.py"), *args],
                               capture_output=True, text=True, env=env)
 
