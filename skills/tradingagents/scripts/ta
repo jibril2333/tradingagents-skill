@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run ta.py with the skill runtime (setup_runtime.py creates it).
+PY="${TRADINGAGENTS_SKILL_PYTHON:-$HOME/.tradingagents-skill/venv/bin/python}"
+if [ ! -x "$PY" ]; then
+  echo '{"status": "setup_required", "error": "Runtime not found. Run scripts/setup_runtime.py with Python 3.10+ or set TRADINGAGENTS_SKILL_PYTHON."}'
+  exit 2
+fi
+exec "$PY" "$(dirname "$0")/ta.py" "$@"

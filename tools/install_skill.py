@@ -1,14 +1,16 @@
-"""Copy this skill to a chosen discovery directory without overwriting."""
+"""Copy this skill to a skill discovery directory without overwriting."""
 
 import argparse
+import os
 from pathlib import Path
 import shutil
+import stat
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dest", type=Path, required=True,
-                        help="Skill parent directory, e.g. PROJECT/.agents/skills")
+    parser.add_argument("--dest", type=Path, default=Path.home() / ".claude" / "skills",
+                        help="Skill parent directory (default: ~/.claude/skills)")
     args = parser.parse_args()
     source = Path(__file__).resolve().parents[1] / "skills" / "tradingagents"
     target = args.dest.expanduser().resolve() / "tradingagents"
@@ -17,6 +19,9 @@ def main():
     if source == target or source in target.parents:
         parser.error("Destination cannot be inside the source skill.")
     shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    if os.name != "nt":
+        launcher = target / "scripts" / "ta"
+        launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print(f"Installed: {target}")
 
 

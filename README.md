@@ -1,79 +1,74 @@
 # TradingAgents Skill
 
-把 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 封装成可安装的 Codex skill，通过 Python 调用实际投研流程，生成 Markdown 报告与 JSON 结果。
+把 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 转换为 Claude Code skill：上游的智能体、提示词、数据工具、辩论路由、报告和记忆日志在本地原样运行，原本发往 LLM API 的每一次调用改由 Claude Code 子代理完成，因此在 Claude 订阅额度内运行，不需要任何 LLM API key。
 
-## 能做什么
+## 工作方式
 
-- 编排市场、情绪、新闻、基本面分析，以及多空辩论和风险评估。
-- 支持股票和上游的 crypto 模式；可选择分析师、模型、语言及辩论轮数。
-- 提供不调用 API 的 `doctor` 和 `--dry-run`。
-- 固定上游源码版本，每次运行隔离缓存、日志、记忆和结果。
-- 保存五档评级以及 `REVIEW` 状态；不连接券商或提交订单。
+```text
+ta.py init ──► 4 个分析师任务 ──(并行子代理)──► ta.py step
+          ──► Bull ⇄ Bear（上游 ConditionalLogic 决定轮次）──► Research Manager
+          ──► Trader ──► Aggressive → Conservative → Neutral ──► Portfolio Manager
+          ──► 上游报告目录、状态日志、记忆日志、五档评级
+```
 
-## 安装 skill
+- `scripts/skill_llm.py` 替换上游传给智能体的 `llm` 对象：没有答案时把完整消息写成任务文件；子代理写回答案后，上游节点再次运行并得到与 API 调用相同形状的结果。
+- 分析师的工具调用通过 `ta.py tool` 执行上游同一批数据工具（yfinance、FRED、Polymarket 等）。
+- Research Manager、Trader、Portfolio Manager、Sentiment Analyst 的结构化输出用上游 Pydantic schema 校验，不合格会退回重写。
+- 模型档位沿用上游：Research Manager、Portfolio Manager 用 deep（默认 `opus`），其余用 quick（默认 `sonnet`）。
+- 默认一次运行 12 次子代理调用；run 目录保存全部状态，中断后可继续。
 
-仓库内 `skills/tradingagents/` 是完整、自包含的 skill。需要 Python 3.10+，推荐 3.12；正式运行还需要 Git、网络和所选 LLM 服务配置。
+逐个调用点的对应关系和与上游的差异见 [architecture.md](skills/tradingagents/references/architecture.md)。
 
-在目标项目中安装：
+## 安装
+
+作为 Claude Code 插件：
+
+```text
+/plugin marketplace add jibril2333/tradingagents-skill
+/plugin install tradingagents@tradingagents-skill
+```
+
+或复制为个人 skill（默认 `~/.claude/skills/tradingagents`）：
 
 ```shell
-python tools/install_skill.py --dest /path/to/project/.agents/skills
+python3 tools/install_skill.py
 ```
-
-Windows PowerShell 示例：
-
-```powershell
-python tools/install_skill.py --dest 'C:\path\to\project\.agents\skills'
-```
-
-也可以手动把整个 `skills/tradingagents` 目录复制到你的 skill 搜索目录。当前官方文档列出用户级 `~/.agents/skills`；已有 Codex 配置采用其他目录时，传入该目录即可。安装器不会覆盖已有 skill。
-
-安装方式依据 [OpenAI 官方 skill 文档](https://learn.chatgpt.com/docs/build-skills)。在支持技能选择的界面选择 TradingAgents，或使用 `$tradingagents`。
-
-示例请求：
-
-> 用 $tradingagents 分析 NVDA，使用我配置的模型，分析日期为今天，输出中文报告。先检查运行配置。
 
 ## 准备运行环境
 
-以下命令在本仓库根目录执行。复制安装后，也可用已安装 skill 中对应脚本的绝对路径。
+需要 Python 3.10+（推荐 3.12）、Git 和网络，只需执行一次：
 
 ```shell
-python skills/tradingagents/scripts/setup_runtime.py --env-dir .venv
+python3 skills/tradingagents/scripts/setup_runtime.py
+skills/tradingagents/scripts/ta doctor
 ```
 
-虚拟环境解释器：Windows 为 `.venv/Scripts/python.exe`；macOS/Linux 为 `.venv/bin/python`。下文的 `PYTHON` 替换为该路径。
+虚拟环境默认位于 `~/.tradingagents-skill/venv`，安装固定提交的上游包。`FRED_API_KEY`（宏观数据）和 `ALPHA_VANTAGE_API_KEY`（可选数据源）为可选项。
 
-```text
-PYTHON skills/tradingagents/scripts/run_analysis.py doctor --provider openai
-PYTHON skills/tradingagents/scripts/run_analysis.py analyze --ticker NVDA --date 2026-09-14 --provider openai --deep-model YOUR_DEEP_MODEL --quick-model YOUR_QUICK_MODEL --language Chinese --output-dir outputs/nvda-2026-09-14 --dry-run
-```
+## 使用
 
-`YOUR_DEEP_MODEL` 和 `YOUR_QUICK_MODEL` 必须替换为你的账户可用、支持工具调用的模型。预览不需要密钥、不创建文件。正式研究时配置对应环境变量并去掉 `--dry-run`；模型及数据服务可能产生费用。
+在 Claude Code 中直接提出需求，例如：
 
-详细配置、供应商表、输出结构和常见故障见 [setup.md](skills/tradingagents/references/setup.md)。
+> 用 TradingAgents 分析 NVDA，日期今天，输出中文报告。
 
-## 兼容性与验证
+skill 会依次执行 `ta init`、派发子代理、`ta step`，完成后读取 `result.json` 与最终决策并总结。输出与上游 CLI 相同：`~/.tradingagents/logs/TICKER/日期/` 下的分节报告与 `message_tool.log`，以及当前目录 `reports/TICKER_时间戳/` 下的完整报告树；另有 `propagate()` 的状态日志与记忆日志。
 
-- 固定上游提交：[`be952b8eccb49720509af544c6675233bc1f10d0`](https://github.com/TauricResearch/TradingAgents/tree/be952b8eccb49720509af544c6675233bc1f10d0)，其包版本为 `0.4.0`。
-- 固定源码不等于所有间接依赖都锁定；安装器遵循上游依赖范围，成功结果记录实际安装版本。
-- `doctor` 校验 pip 的 VCS 来源与提交，避免误用同名 PyPI 包或不同版本。
-- 离线测试验证参数、评级保留、输出隔离、失败记录和安装行为，不代表真实模型或行情服务已通过端到端测试。
+不带参数时的行为与上游默认一致：代码归一化、按 ticker 判定资产类型（加密货币自动去掉基本面分析师）、分析师全选、辩论与风险讨论各 1 轮、英文输出、yfinance 数据源、跨运行记忆日志。数据工具经上游 `ToolNode` 执行，报错规则与上游相同；其他上游配置项可用 `--config` 传入。常用参数：`--research-depth`（对应上游 CLI 的 1/3/5 档，同时设置两个轮数）、`--analysts`、`--quick-model`、`--deep-model`、`--language`、`--no-memory`。完整说明见 [SKILL.md](skills/tradingagents/SKILL.md) 与 [setup.md](skills/tradingagents/references/setup.md)。
+
+## 额度
+
+费用由 LLM API 计费变为占用订阅额度。实测一次默认运行（NVDA，4 个分析师，辩论与风险讨论各 1 轮）的子代理用量记录在 [VALIDATION.md](VALIDATION.md)。减少额度占用的方式：减少分析师、保持辩论轮数为 1、将 `--deep-model` 设为 `sonnet`。
+
+## 验证
 
 ```shell
-python -m unittest discover -s tests -v
+~/.tradingagents-skill/venv/bin/python -m unittest discover -s tests -v
 ```
 
-可选安装环境后的离线接口检查：
-
-```text
-PYTHON tools/smoke_upstream.py
-```
-
-它构建真实上游 graph、验证入口签名及报告导出，并封锁 socket 网络连接，不请求模型或行情。
+离线测试运行真实上游代码，封锁网络并以固定答案代替子代理，覆盖完整流程顺序、结构化答案校验与回退、多轮辩论、记忆复盘和工具命令。真实运行记录见 [VALIDATION.md](VALIDATION.md)。
 
 ## 范围
 
-这是独立的 skill 适配仓库，非 TauricResearch 官方产品。历史日期分析仍可能受当前基本面、新闻覆盖和模型知识影响，不能直接视作无前视偏差回测。输出是研究材料。
+独立的适配仓库，非 TauricResearch 官方产品。历史日期分析可能受当前基本面、新闻覆盖和模型知识影响，不能视作无前视偏差回测。输出是研究材料，不是投资建议；不连接券商、不下单。
 
-本仓库采用 Apache-2.0，来源说明见 [NOTICE](NOTICE)。上游源码在安装时获取，不在本仓库重复分发。维护与升级说明见 [upstream.md](skills/tradingagents/references/upstream.md)。
+采用 Apache-2.0，来源说明见 [NOTICE](NOTICE)。上游版本与升级步骤见 [upstream.md](skills/tradingagents/references/upstream.md)。

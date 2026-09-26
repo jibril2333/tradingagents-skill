@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tradingagents-skill",
+  "description": "TradingAgents multi-agent research as a Claude Code skill.",
+  "owner": {
+    "name": "jibril2333"
+  },
+  "plugins": [
+    {
+      "name": "tradingagents",
+      "description": "Run the TradingAgents multi-agent research workflow with Claude Code subagents instead of LLM API calls.",
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/jibril2333/tradingagents-skill"
+    }
+  ]
+}
