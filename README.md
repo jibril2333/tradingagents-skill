@@ -21,29 +21,62 @@ ta.py init ──► 4 个分析师任务 ──(并行子代理)──► ta.py
 
 ## 安装
 
-作为 Claude Code 插件：
+前提：Claude Code（订阅或 API 均可）、Git、网络。Python 不需要预先准备到特定版本，见下文。
+
+### 1. 安装插件
+
+在 Claude Code 中执行：
 
 ```text
 /plugin marketplace add jibril2333/tradingagents-skill
 /plugin install tradingagents@tradingagents-skill
 ```
 
-或复制为个人 skill（默认 `~/.claude/skills/tradingagents`）：
+或在终端执行：
 
 ```shell
-python3 tools/install_skill.py
+claude plugin marketplace add jibril2333/tradingagents-skill
+claude plugin install tradingagents@tradingagents-skill
 ```
 
-## 准备运行环境
+装好后重启 Claude Code 会话，skill 即可用。
 
-需要 Python 3.10+（推荐 3.12）、Git 和网络，只需执行一次：
+### 2. 运行环境（首次使用时自动完成）
+
+第一次提出分析需求时，Claude 会运行 `ta doctor`，发现环境不存在后执行 `setup_runtime.py`，在 `~/.tradingagents-skill/venv` 创建虚拟环境并安装固定提交的上游 TradingAgents，约半分钟到数分钟，只需一次。
+
+安装脚本可以用任意 Python 3 启动，包括 macOS 自带的 3.9。启动它的解释器低于 3.10 时，脚本依次使用 PATH 与 Homebrew 目录中的 `python3.13`…`python3.10`、Windows 的 `py` 启动器；都没有时，若装有 [uv](https://docs.astral.sh/uv/) 则由 uv 下载 Python 3.12；仍不满足时给出安装选项并退出。
+
+也可以手动预先安装：
 
 ```shell
-python3 skills/tradingagents/scripts/setup_runtime.py
-skills/tradingagents/scripts/ta doctor
+python3 ~/.claude/plugins/cache/tradingagents-skill/tradingagents/*/skills/tradingagents/scripts/setup_runtime.py
 ```
 
-虚拟环境默认位于 `~/.tradingagents-skill/venv`，安装固定提交的上游包。`FRED_API_KEY`（宏观数据）和 `ALPHA_VANTAGE_API_KEY`（可选数据源）为可选项。
+`FRED_API_KEY`（宏观数据）和 `ALPHA_VANTAGE_API_KEY`（可选数据源）为可选项，不需要任何 LLM API key。
+
+### 3. 减少权限确认（可选）
+
+分析师子代理通过 Bash 调用 `ta.py tool` 取数，一次分析约 20–30 次。每次都需确认时，可在 Claude Code 权限设置中允许以 `~/.tradingagents-skill/venv/bin/python` 开头、包含 `scripts/ta.py tool` 的命令。
+
+### 更新与卸载
+
+```shell
+claude plugin marketplace update tradingagents-skill
+claude plugin update tradingagents@tradingagents-skill
+claude plugin uninstall tradingagents@tradingagents-skill
+```
+
+卸载插件不会删除运行环境与结果；需要时手动删除 `~/.tradingagents-skill/`（运行环境）与 `~/.tradingagents/`（结果、缓存与记忆日志）。
+
+### 不使用插件系统
+
+复制为个人 skill（默认 `~/.claude/skills/tradingagents`）：
+
+```shell
+git clone https://github.com/jibril2333/tradingagents-skill.git
+python3 tradingagents-skill/tools/install_skill.py
+```
 
 ## 使用
 
