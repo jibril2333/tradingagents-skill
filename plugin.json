@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "tradingagents",
+  "version": "0.4.0",
+  "description": "Run the TradingAgents multi-agent research workflow with subagents instead of LLM API calls.",
+  "author": {
+    "name": "jibril2333"
+  },
+  "homepage": "https://github.com/jibril2333/tradingagents-skill",
+  "repository": "https://github.com/jibril2333/tradingagents-skill",
+  "license": "Apache-2.0",
+  "keywords": ["trading", "research", "multi-agent", "tradingagents"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "TradingAgents",
+        "shortDescription": "Multi-agent market research with subagents instead of LLM API calls",
+        "developerName": "jibril2333",
+        "category": "Productivity",
+        "defaultPrompt": ["Use $tradingagents to analyze NVDA for today and write the report in Chinese."]
+      }
+    }
+  }
+}

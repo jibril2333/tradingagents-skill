@@ -1,6 +1,6 @@
 # TradingAgents Skill
 
-把 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 转换为 Claude Code skill：上游的智能体、提示词、数据工具、辩论路由、报告和记忆日志在本地原样运行，原本发往 LLM API 的每一次调用改由 Claude Code 子代理完成，因此在 Claude 订阅额度内运行，不需要任何 LLM API key。
+把 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 转换为 Claude Code 与 Codex 的 skill：上游的智能体、提示词、数据工具、辩论路由、报告和记忆日志在本地原样运行，原本发往 LLM API 的每一次调用改由宿主的子代理完成，因此在 Claude 或 ChatGPT 订阅额度内运行，不需要任何 LLM API key。
 
 ## 工作方式
 
@@ -14,16 +14,16 @@ ta.py init ──► 4 个分析师任务 ──(并行子代理)──► ta.py
 - `scripts/skill_llm.py` 替换上游传给智能体的 `llm` 对象：没有答案时把完整消息写成任务文件；子代理写回答案后，上游节点再次运行并得到与 API 调用相同形状的结果。
 - 分析师的工具调用通过 `ta.py tool` 执行上游同一批数据工具（yfinance、FRED、Polymarket 等）。
 - Research Manager、Trader、Portfolio Manager、Sentiment Analyst 的结构化输出用上游 Pydantic schema 校验，不合格会退回重写。
-- 模型档位沿用上游：Research Manager、Portfolio Manager 用 deep（默认 `opus`），其余用 quick（默认 `sonnet`）。
+- 模型档位沿用上游：Research Manager、Portfolio Manager 用 deep，其余用 quick。默认值随宿主：Claude Code 为 `opus` / `sonnet`，Codex 为 `gpt-6-sol` / `gpt-6-luna`。
 - 默认一次运行 12 次子代理调用；run 目录保存全部状态，中断后可继续。
 
 逐个调用点的对应关系和与上游的差异见 [architecture.md](skills/tradingagents/references/architecture.md)。
 
 ## 安装
 
-前提：Claude Code（订阅或 API 均可）、Git、网络。Python 不需要预先准备到特定版本，见下文。
+支持 Claude Code 与 Codex。前提：其中一个客户端、Git、网络。Python 不需要预先准备到特定版本，见下文。
 
-### 1. 安装插件
+### 1. 安装插件（Claude Code）
 
 在 Claude Code 中执行：
 
@@ -41,9 +41,35 @@ claude plugin install tradingagents@tradingagents-skill
 
 装好后重启 Claude Code 会话，skill 即可用。
 
+### 1'. 安装到 Codex
+
+以下方式依据 Codex 文档编写，任选其一，装好后重启 Codex：
+
+- 插件：本仓库根目录的 `plugin.json` 与 `.agents/plugins/marketplace.json` 按 Codex 插件格式提供。
+
+  ```shell
+  codex plugin marketplace add jibril2333/tradingagents-skill
+  ```
+
+  随后在 Codex 的插件列表中安装 `tradingagents`。
+- skill 安装器：在 Codex 中输入
+
+  ```text
+  $skill-installer install https://github.com/jibril2333/tradingagents-skill/tree/main/skills/tradingagents
+  ```
+
+- 手动复制到用户级 skill 目录 `~/.agents/skills`：
+
+  ```shell
+  git clone https://github.com/jibril2333/tradingagents-skill.git
+  python3 tradingagents-skill/tools/install_skill.py --host codex
+  ```
+
+在 Codex 中使用时，子代理由 Codex 的子代理功能启动，模型默认为 `gpt-6-luna`（quick）与 `gpt-6-sol`（deep）。Codex 默认沙箱不联网，取数命令会逐次请求批准；放开方式见 [setup.md](skills/tradingagents/references/setup.md) 的 Codex 一节。
+
 ### 2. 运行环境（首次使用时自动完成）
 
-第一次提出分析需求时，Claude 会运行 `ta doctor`，发现环境不存在后执行 `setup_runtime.py`，在 `~/.tradingagents-skill/venv` 创建虚拟环境并安装固定提交的上游 TradingAgents，约半分钟到数分钟，只需一次。
+第一次提出分析需求时，宿主 agent 会运行 `ta doctor`，发现环境不存在后执行 `setup_runtime.py`，在 `~/.tradingagents-skill/venv` 创建虚拟环境并安装固定提交的上游 TradingAgents，约半分钟到数分钟，只需一次。
 
 安装脚本可以用任意 Python 3 启动，包括 macOS 自带的 3.9。启动它的解释器低于 3.10 时，脚本依次使用 PATH 与 Homebrew 目录中的 `python3.13`…`python3.10`、Windows 的 `py` 启动器；都没有时，若装有 [uv](https://docs.astral.sh/uv/) 则由 uv 下载 Python 3.12；仍不满足时给出安装选项并退出。
 
@@ -56,6 +82,9 @@ python3 ~/.claude/plugins/cache/tradingagents-skill/tradingagents/*/skills/tradi
 `FRED_API_KEY`（宏观数据）和 `ALPHA_VANTAGE_API_KEY`（可选数据源）为可选项，不需要任何 LLM API key。
 
 ### 3. 减少权限确认（可选）
+
+Codex 见上一节。以下为 Claude Code：
+
 
 分析师子代理通过 Bash 调用 `ta.py tool` 取数，一次分析约 20–30 次。每次都需确认时，可在 Claude Code 权限设置中允许以 `~/.tradingagents-skill/venv/bin/python` 开头、包含 `scripts/ta.py tool` 的命令。
 

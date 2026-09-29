@@ -33,6 +33,18 @@ python3 SKILL_DIR/scripts/setup_runtime.py
 
 每次调用都需确认时，可在 Claude Code 的权限设置中允许以 `.../venv/bin/python .../scripts/ta.py tool` 开头的 Bash 命令。
 
+### Codex
+
+Codex 在本地默认使用 `workspace-write` 沙箱且不联网；审批策略为 `on-request` 时，联网命令和写工作区以外的命令都要逐次批准，子代理继承父会话的沙箱。本 skill 的 `ta` 命令需要联网（行情、新闻、宏观数据），并写入 `~/.tradingagents`（结果、缓存、记忆日志）与 `~/.tradingagents-skill`（运行环境）。一次运行约有 20–30 次取数，逐次批准不现实时，可在 `~/.codex/config.toml` 中放开：
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["/Users/NAME/.tradingagents", "/Users/NAME/.tradingagents-skill"]
+```
+
+`network_access = true` 对该沙箱中的所有命令生效，是否开启由用户决定。分析师并行需要至少 4 个子代理线程；若设置过 `agents.max_concurrent_threads_per_session`，不要低于 4。已装有其他同类 skill 时，可用 `skills.config` 停用其一，避免同一请求触发两个 skill。
+
 ## 排错
 
 | 现象 | 处理 |
